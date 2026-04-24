@@ -1,0 +1,183 @@
+name: Build and Deploy mogause
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME_PROD }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN_PROD }}
+  HOST: ${{ secrets.SSH_HOST_TEMP }}
+  HOST_USERNAME: ${{ secrets.SSH_USERNAME_TEMP }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_TEMP }}
+  BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME_PROD }}/mogause-backend:latest
+  AGENT_IMAGE: ${{ secrets.DOCKER_USERNAME_PROD }}/mogause-agent:latest
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+
+      - name: Build backend image (PR validation)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: false
+          tags: mogause-backend:pr
+
+      - name: Build agent image (PR validation)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.agent
+          push: false
+          tags: mogause-agent:pr
+
+      - name: Build and push backend image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: ${{ env.BACKEND_IMAGE }}
+          cache-from: type=gha,scope=mogause-backend
+          cache-to: type=gha,mode=max,scope=mogause-backend
+
+      - name: Build and push agent image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.agent
+          push: true
+          tags: ${{ env.AGENT_IMAGE }}
+          cache-from: type=gha,scope=mogause-agent
+          cache-to: type=gha,mode=max,scope=mogause-agent
+
+      - name: Deploy to Ubuntu server
+        if: github.event_name == 'push'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ env.HOST }}
+          username: ${{ env.HOST_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "Deployment started at $(date '+%Y-%m-%d %H:%M:%S UTC')"
+
+            APP_DIR=/home/ubuntu/mogause
+            BACKEND_ENV=$APP_DIR/.env.backend
+            AGENT_ENV=$APP_DIR/.env.agent
+            FRONTEND_ENV=$APP_DIR/.env.frontend
+
+            if [ ! -f "$BACKEND_ENV" ]; then
+              echo "❌ Missing backend env file: $BACKEND_ENV"
+              exit 1
+            fi
+            if [ ! -f "$AGENT_ENV" ]; then
+              echo "❌ Missing agent env file: $AGENT_ENV"
+              exit 1
+            fi
+            if [ ! -f "$FRONTEND_ENV" ]; then
+              echo "⚠️ Frontend env file not found: $FRONTEND_ENV (required only if/when frontend is containerized)"
+            fi
+
+            echo "Creating Docker network if missing..."
+            sudo docker network create mogause-net >/dev/null 2>&1 || true
+
+            echo "Stopping old containers..."
+            sudo docker stop mogause-agent mogause-backend || true
+            sudo docker rm mogause-agent mogause-backend || true
+
+            echo "Pulling latest images..."
+            sudo docker pull ${{ env.BACKEND_IMAGE }}
+            sudo docker pull ${{ env.AGENT_IMAGE }}
+
+            echo "Starting backend..."
+            sudo docker run -d \
+              --name mogause-backend \
+              --restart unless-stopped \
+              --network mogause-net \
+              -p 8080:4002 \
+              -v $BACKEND_ENV:/app/.env:ro \
+              ${{ env.BACKEND_IMAGE }}
+
+            echo "Starting agent..."
+            sudo docker run -d \
+              --name mogause-agent \
+              --restart unless-stopped \
+              --network mogause-net \
+              -e AGENT_DAEMON_MODE=true \
+              -v $AGENT_ENV:/app/.env:ro \
+              ${{ env.AGENT_IMAGE }}
+
+            echo "Verifying deployment..."
+            sleep 10
+
+            if ! sudo docker ps --format '{{.Names}}' | grep -q '^mogause-backend$'; then
+              echo "❌ Backend container failed to start"
+              sudo docker logs mogause-backend || true
+              exit 1
+            fi
+
+            if ! sudo docker ps --format '{{.Names}}' | grep -q '^mogause-agent$'; then
+              echo "❌ Agent container failed to start"
+              sudo docker logs mogause-agent || true
+              exit 1
+            fi
+
+            echo "✅ Both containers are running"
+            echo "Backend logs:"
+            sudo docker logs --tail 30 mogause-backend
+            echo "Agent logs:"
+            sudo docker logs --tail 30 mogause-agent
+            echo "Deployment completed at $(date '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Post-deploy verification
+        if: github.event_name == 'push' && success()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ env.HOST }}
+          username: ${{ env.HOST_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script: |
+            if sudo docker ps --format '{{.Names}}' | grep -q '^mogause-backend$'; then
+              echo "Backend container status:"
+              sudo docker inspect mogause-backend --format='Status: {{.State.Status}} | Started At: {{.State.StartedAt}}'
+              echo "Backend port mapping:"
+              sudo docker port mogause-backend
+              echo "Checking backend .env mount:"
+              sudo docker exec mogause-backend ls -la /app/.env
+            else
+              echo "❌ mogause-backend is not running"
+              exit 1
+            fi
+
+            if sudo docker ps --format '{{.Names}}' | grep -q '^mogause-agent$'; then
+              echo "Agent container status:"
+              sudo docker inspect mogause-agent --format='Status: {{.State.Status}} | Started At: {{.State.StartedAt}}'
+              echo "Checking agent .env mount:"
+              sudo docker exec mogause-agent ls -la /app/.env
+            else
+              echo "❌ mogause-agent is not running"
+              exit 1
+            fi
