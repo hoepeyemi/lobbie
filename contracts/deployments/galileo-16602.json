@@ -3,5 +3,6 @@
   "chainId": 16602,
   "contractName": "AgentRegistry",
   "address": "0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D",
-  "blockExplorer": "https://chainscan-galileo.0g.ai"
+  "blockExplorer": "https://chainscan-galileo.0g.ai",
+  "note": "Backend reads this contract via EVM_RPC_URL; set AGENT_REGISTRY_FROM_BLOCK to the deployment block for faster log scans."
 }

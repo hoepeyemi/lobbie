@@ -17,6 +17,23 @@ export default function AgentsPage() {
     chainId?: string;
     networkName?: string;
   }>({});
+  const [onChain, setOnChain] = useState<{
+    enabled?: boolean;
+    error?: string;
+    agents?: Array<{
+      address: string;
+      name: string;
+      category: string;
+      reputation: number;
+      reputationBps: number;
+      price0G: string;
+      jobsCompleted: number;
+      totalEarned0G: string;
+      isActive: boolean;
+      efficiencyScore: number;
+    }>;
+    syncedAt?: string;
+  } | null>(null);
 
   useEffect(() => {
     const fetchAgents = async () => {
@@ -31,6 +48,7 @@ export default function AgentsPage() {
           chainId: data.chainId,
           networkName: data.networkName,
         });
+        setOnChain(data.onChain ?? null);
         setError(null);
       } catch (err: any) {
         console.error('Failed to fetch agents:', err);
@@ -173,6 +191,65 @@ export default function AgentsPage() {
           >
             Retry Connection
           </button>
+        </div>
+      )}
+
+      {onChain?.error && (
+        <div className="glass-panel" style={{ padding: 16, marginBottom: 24, borderColor: 'rgba(251, 191, 36, 0.4)' }}>
+          <p className="mono" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            EVM registry sync: {onChain.error}
+          </p>
+        </div>
+      )}
+
+      {onChain?.enabled && (onChain.agents?.length ?? 0) > 0 && (
+        <div style={{ marginBottom: 32 }}>
+          <h2 className="mono" style={{ fontSize: '1.25rem', fontWeight: 800, marginBottom: 16, color: '#111111' }}>
+            {t.evmOnChainTitle}
+          </h2>
+          <div
+            className="glass-panel"
+            style={{ overflow: 'auto', padding: 0, border: '1px solid var(--border-subtle)' }}
+          >
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', background: 'rgba(0,0,0,0.03)' }}>
+                  <th style={{ padding: 12, fontWeight: 700 }}>{t.evmName}</th>
+                  <th style={{ padding: 12, fontWeight: 700 }}>{t.evmAddress}</th>
+                  <th style={{ padding: 12, fontWeight: 700 }}>{t.evmCategory}</th>
+                  <th style={{ padding: 12, fontWeight: 700 }}>Rep</th>
+                  <th style={{ padding: 12, fontWeight: 700 }}>{t.evmPrice0g}</th>
+                  <th style={{ padding: 12, fontWeight: 700 }}>Jobs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(onChain.agents || []).map((a) => (
+                  <tr key={a.address} style={{ borderTop: '1px solid var(--border-subtle)' }}>
+                    <td style={{ padding: 10, fontWeight: 600 }}>{a.name || '—'}</td>
+                    <td className="mono" style={{ padding: 10, wordBreak: 'break-all' }}>
+                      <a
+                        href={`${blockExplorerBase}/address/${a.address}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: 'var(--accent-primary)' }}
+                      >
+                        {a.address}
+                      </a>
+                    </td>
+                    <td style={{ padding: 10 }}>{a.category}</td>
+                    <td style={{ padding: 10 }}>{a.reputation}%</td>
+                    <td className="mono" style={{ padding: 10 }}>{a.price0G}</td>
+                    <td style={{ padding: 10 }}>{a.jobsCompleted}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {onChain.syncedAt && (
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: 8 }}>
+              {t.evmSyncedAt} {new Date(onChain.syncedAt).toLocaleString()}
+            </p>
+          )}
         </div>
       )}
 

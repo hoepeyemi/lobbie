@@ -631,12 +631,28 @@ async function startRepl() {
       if (trimmed === 'registry') {
         try {
           const res = await axios.get(`${SERVER_URL}/api/registry`);
-          console.log('\n┌─ On-Chain Agent Registry ─────────────────────────────────┐');
+          const oc = res.data.onChain as
+            | { enabled?: boolean; error?: string; agents?: Array<{ name: string; reputation: number; jobsCompleted: number; totalEarned0G: string; address: string }> }
+            | undefined;
+          console.log('\n┌─ Marketplace agents (x402 / backend) ────────────────────┐');
           for (const a of res.data.agents) {
             console.log(`│ ${a.name.padEnd(22)} Rep: ${a.reputation.toString().padEnd(3)}/100 | Jobs: ${a.jobsCompleted.toString().padEnd(5)} | Earned: ${a.totalEarned.toFixed(1)} XLM │`);
           }
-          console.log(`│ Contract: ${res.data.contractAddress} │`);
           console.log('└───────────────────────────────────────────────────────────┘');
+          if (oc?.error) {
+            console.log(`[registry] EVM sync note: ${oc.error}`);
+          }
+          if (oc?.enabled && (oc.agents?.length ?? 0) > 0) {
+            console.log('\n┌─ EVM AgentRegistry (0G-Galileo) ─────────────────────────┐');
+            for (const a of oc.agents || []) {
+              const earn = a.totalEarned0G ?? '0';
+              console.log(
+                `│ ${(a.name || '').slice(0, 20).padEnd(20)} Rep: ${String(a.reputation).padEnd(3)}/100 | Jobs: ${String(a.jobsCompleted).padEnd(5)} | 0G: ${earn} | ${(a.address || '').slice(0, 10)}… │`,
+              );
+            }
+            console.log('└───────────────────────────────────────────────────────────┘');
+          }
+          console.log(`Contract (EVM): ${res.data.contractAddress}`);
         } catch { console.log('Failed to fetch registry.'); }
         prompt();
         return;

@@ -31,6 +31,7 @@ interface EconomyStats {
   totalVolume: string;
   a2aCount: number;
   activeAgents: number;
+  evmOnChain: number;
 }
 
 const NODE_COLORS: Record<string, { bg: string; border: string; glow: string }> = {
@@ -54,7 +55,7 @@ export default function EconomyGraph({ refreshTrigger = 0 }: { refreshTrigger?: 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const [edges, setEdges] = useState<PaymentEdge[]>([]);
-  const [stats, setStats] = useState<EconomyStats>({ totalPayments: 0, totalVolume: '0', a2aCount: 0, activeAgents: 0 });
+  const [stats, setStats] = useState<EconomyStats>({ totalPayments: 0, totalVolume: '0', a2aCount: 0, activeAgents: 0, evmOnChain: 0 });
   const [registry, setRegistry] = useState<any[]>([]);
   const nodesRef = useRef<PaymentNode[]>([]);
 
@@ -89,11 +90,13 @@ export default function EconomyGraph({ refreshTrigger = 0 }: { refreshTrigger?: 
           fetch(`${API}/api/registry`).then(r => r.json()).catch(() => ({ agents: [] })),
         ]);
         setRegistry(registryRes.agents || []);
+        const evmN = (registryRes as { onChain?: { agents?: unknown[] } }).onChain?.agents?.length ?? 0;
         setStats({
           totalPayments: paymentsRes.count || 0,
           totalVolume: paymentsRes.totalVolume || '0',
           a2aCount: paymentsRes.a2aCount || 0,
           activeAgents: (registryRes.agents || []).length,
+          evmOnChain: evmN,
         });
         // Build edges from payments
         const payments = paymentsRes.payments || [];
@@ -252,6 +255,7 @@ export default function EconomyGraph({ refreshTrigger = 0 }: { refreshTrigger?: 
             { label: 'Volume', value: `${stats.totalVolume} XLM`, color: '#FF854B' },
             { label: 'A2A Hires', value: stats.a2aCount, color: '#f59e0b' },
             { label: 'Agents', value: stats.activeAgents, color: '#FF854B' },
+            { label: 'EVM (0G)', value: stats.evmOnChain, color: '#7c3aed' },
           ].map(s => (
             <div key={s.label} style={{ textAlign: 'center' }}>
               <div style={{ fontSize: '0.95rem', fontWeight: 700, color: s.color, fontFamily: 'var(--font-mono)' }}>{s.value}</div>

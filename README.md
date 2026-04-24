@@ -218,6 +218,8 @@ The **Solidity `AgentRegistry`** on **0G-Galileo-Testnet** (chain id **16602**) 
 
 Deployed address (testnet): `0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D` — [ChainScan](https://chainscan-galileo.0g.ai/address/0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D).
 
+The **backend** loads live registry state over `EVM_RPC_URL`: it indexes `AgentRegistered` logs, then calls `getAgent` / `getEfficiencyScore` per address, and returns that as `onChain` on `GET /api/registry` and `GET /api/stats` (45s in-process cache). The **frontend** agents page and **Economy** graph use that payload; the **agent** CLI `registry` command prints both marketplace agents and EVM-registered rows.
+
 ---
 
 ## Tech Stack

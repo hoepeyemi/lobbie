@@ -45,6 +45,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
 import axios from 'axios';
 import { EXTERNAL_AGENTS, callExternalAgent } from './universal-adapter.js';
+import { fetchOnChainRegistry } from './evm/onChainRegistry.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -1166,10 +1167,12 @@ function getToolParams(id: string): Record<string, string> {
 // Route — GET /api/registry (On-chain Agent Registry)
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.get('/api/registry', (req: Request, res: Response) => {
+app.get('/api/registry', async (req: Request, res: Response) => {
   const category = req.query.category as string;
   const sortBy = (req.query.sort as string) || 'efficiency';
   const minReputation = parseInt(req.query.minRep as string) || 0;
+
+  const onChainRegistry = await fetchOnChainRegistry(AGENT_REGISTRY_CONTRACT_ADDRESS);
 
   let agents = [...agentRegistry].filter(a => a.isActive && a.reputation >= minReputation);
 
@@ -1192,10 +1195,14 @@ app.get('/api/registry', (req: Request, res: Response) => {
       agents.sort((a, b) => b.efficiency - a.efficiency);
   }
 
+  const offChainCategories = agentRegistry.map(a => a.category);
+  const onChainCategories = onChainRegistry.agents.map(a => a.category);
+  const categories = [...new Set([...offChainCategories, ...onChainCategories])];
+
   res.json({
     agents,
     count: agents.length,
-    categories: [...new Set(agentRegistry.map(a => a.category))],
+    categories,
     contractAddress: AGENT_REGISTRY_CONTRACT_ADDRESS,
     contractExplorerUrl: AGENT_REGISTRY_EXPLORER_URL,
     chainId: CHAIN_ID,
@@ -1204,6 +1211,8 @@ app.get('/api/registry', (req: Request, res: Response) => {
     blockExplorer: BLOCK_EXPLORER_BASE,
     /** x402 / MPP settlement network id (Stellar) — distinct from the EVM registry chain above. */
     network: NETWORK,
+    /** Live data from `AgentRegistry` (EVM) via RPC — indexed `AgentRegistered` + `getAgent`. */
+    onChain: onChainRegistry,
   });
 });
 
@@ -1228,9 +1237,11 @@ app.get('/api/payments', (_req: Request, res: Response) => {
 // Route — GET /api/stats (Economy Statistics)
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.get('/api/stats', (_req: Request, res: Response) => {
+app.get('/api/stats', async (_req: Request, res: Response) => {
   const a2aPayments = paymentLogs.filter(p => p.isA2A);
   const h2aPayments = paymentLogs.filter(p => !p.isA2A);
+
+  const onChainRegistry = await fetchOnChainRegistry(AGENT_REGISTRY_CONTRACT_ADDRESS);
 
   res.json({
     economy: {
@@ -1241,6 +1252,7 @@ app.get('/api/stats', (_req: Request, res: Response) => {
       activeAgents: agentRegistry.filter(a => a.isActive).length,
       avgReputation: Math.round(agentRegistry.reduce((s, a) => s + a.reputation, 0) / agentRegistry.length),
       maxHiringDepth: Math.max(0, ...paymentLogs.map(p => p.depth)),
+      evmRegistryAgents: onChainRegistry.agents.length,
     },
     topAgents: agentRegistry
       .sort((a, b) => b.reputation - a.reputation)
@@ -1252,6 +1264,7 @@ app.get('/api/stats', (_req: Request, res: Response) => {
     contractExplorerUrl: AGENT_REGISTRY_EXPLORER_URL,
     chainId: CHAIN_ID,
     networkName: NETWORK_NAME,
+    onChain: onChainRegistry,
     uptime: process.uptime(),
   });
 });

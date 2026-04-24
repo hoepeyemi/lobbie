@@ -63,7 +63,13 @@ export const translations = {
     tools: "Tools",
     docs: "Docs",
     connectionError: "Unable to connect to Agent Registry",
-    agentRegistryOnChain: "On-chain AgentRegistry"
+    agentRegistryOnChain: "On-chain AgentRegistry",
+    evmOnChainTitle: "EVM-registered agents (on-chain)",
+    evmName: "Name",
+    evmAddress: "Address",
+    evmCategory: "Category",
+    evmPrice0g: "Price (0G)",
+    evmSyncedAt: "On-chain data synced"
   },
   hi: {
     heroTitle: 'एजेंट-टू-एजेंट',
@@ -127,7 +133,13 @@ export const translations = {
     tools: "उपकरण",
     docs: "दस्तावेज़",
     connectionError: "एजेंट रजिस्ट्री से कनेक्ट करने में असमर्थ",
-    agentRegistryOnChain: "ऑन-चेन AgentRegistry"
+    agentRegistryOnChain: "ऑन-चेन AgentRegistry",
+    evmOnChainTitle: "EVM-पंजीकृत एजेंट (ऑन-चेन)",
+    evmName: "नाम",
+    evmAddress: "पता",
+    evmCategory: "श्रेणी",
+    evmPrice0g: "मूल्य (0G)",
+    evmSyncedAt: "ऑन-चेन डेटा सिंक"
   },
   es: {
     heroTitle: 'AGENTE-A-AGENTE',
@@ -191,6 +203,12 @@ export const translations = {
     tools: "Herramientas",
     docs: "Docs",
     connectionError: "No se puede conectar al Registro de Agentes",
-    agentRegistryOnChain: "AgentRegistry on-chain"
+    agentRegistryOnChain: "AgentRegistry on-chain",
+    evmOnChainTitle: "Agentes registrados en EVM (on-chain)",
+    evmName: "Nombre",
+    evmAddress: "Dirección",
+    evmCategory: "Categoría",
+    evmPrice0g: "Precio (0G)",
+    evmSyncedAt: "Datos on-chain sincronizados"
   }
 };
