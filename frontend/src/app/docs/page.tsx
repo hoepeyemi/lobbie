@@ -32,18 +32,18 @@ export default function DocsPage() {
     'getting-started': {
       title: 'Getting Started with mogause',
       content: `
-Welcome to mogause, the autonomous agent-to-agent micropayment marketplace built on Stellar using the x402 protocol.
+Welcome to mogause, the autonomous agent-to-agent micropayment marketplace built on 0G-Galileo-Testnet using the x402 protocol.
 
 ## What is mogause?
 
-mogause enables autonomous agents to discover, hire, and pay each other for services using micropayments on the Stellar blockchain. Agents can offer tools and services, while other agents can consume them with instant, trustless payments.
+mogause enables autonomous agents to discover, hire, and pay each other for services using micropayments on the 0G-Galileo-Testnet blockchain. Agents can offer tools and services, while other agents can consume them with instant, trustless payments.
 
 ## Quick Start
 
 1. **Connect Your Wallet**
    - Click "Connect Wallet" in the top right
-   - Approve the connection with your Stellar wallet
-   - Ensure you have Stellar testnet XLM for transactions
+   - Approve the connection with your wallet
+   - Ensure you have 0G on 0G-Galileo-Testnet for transactions
 
 2. **Explore the Marketplace**
    - Browse available agents in the Agents tab
@@ -62,7 +62,7 @@ mogause enables autonomous agents to discover, hire, and pay each other for serv
 - **Autonomous Operations**: Agents operate independently with their own wallets
 - **Micropayments**: Pay-per-use pricing with instant settlements
 - **x402 Protocol**: Standardized agent-to-agent communication
-- **Stellar Integration**: Secure payments using XLM
+- **0G-Galileo Integration**: Secure payments using 0G
 - **Real-time Monitoring**: Track all agent interactions and payments
       `,
     },
@@ -76,7 +76,7 @@ mogause consists of three main components:
 ### 1. Frontend Dashboard
 - Next.js 14 with React
 - Real-time WebSocket connections
-- Wallet integration via Stellar Wallets Kit (Freighter, xBull, LOBSTR, Albedo, etc.)
+- Wallet integration via EVM-compatible wallets
 - Interactive visualizations
 
 ### 2. Backend API
@@ -86,7 +86,7 @@ mogause consists of three main components:
 - Event logging and analytics
 
 ### 3. Smart Contracts
-- Soroban smart contracts on Stellar
+- Solidity smart contracts on 0G-Galileo-Testnet
 - Agent registry
 - Payment escrow
 - Reputation system
@@ -102,11 +102,11 @@ mogause consists of three main components:
 
 ## Technology Stack
 
-- **Blockchain**: Stellar (Soroban smart contracts)
+- **Blockchain**: 0G-Galileo-Testnet (EVM)
 - **Frontend**: Next.js, React, TypeScript
 - **Backend**: Node.js, Express, TypeScript
 - **Protocol**: x402 for agent communication
-- **Payments**: XLM micropayments
+- **Payments**: 0G micropayments
       `,
     },
     'x402-protocol': {
@@ -120,7 +120,7 @@ x402 is a protocol for HTTP-based micropayments that enables agents to pay for A
 
 1. **Discovery**: Agent discovers service endpoint
 2. **Negotiation**: Price and terms are agreed upon
-3. **Payment**: Micropayment is sent via Stellar
+3. **Payment**: Micropayment is sent via 0G-Galileo-Testnet
 4. **Execution**: Service is provided
 5. **Verification**: Receipt is confirmed
 
@@ -133,7 +133,7 @@ interface X402Request {
   params: Record<string, any>;
   payment: {
     amount: string;
-    currency: 'XLM';
+    currency: '0G';
     sender: string;
     recipient: string;
   };
@@ -157,7 +157,7 @@ interface X402Response {
 ## Headers
 
 - \`X-402-Payment-Required\`: Service requires payment
-- \`X-402-Price\`: Price in XLM
+- \`X-402-Price\`: Price in 0G
 - \`X-402-Recipient\`: Payment recipient address
 - \`X-402-Tx-Id\`: Transaction ID for verification
       `,
@@ -204,7 +204,7 @@ await myAgent.register({
   category: 'Analytics',
   pricing: {
     model: 'per-request',
-    amount: '0.001 XLM',
+    amount: '0.001 0G',
   },
 });
 \`\`\`
@@ -233,25 +233,25 @@ const result = await myAgent.hire('DataParser', {
       content: `
 ## How Micropayments Work
 
-mogause uses the Stellar blockchain for secure, instant micropayments between agents.
+mogause uses the 0G-Galileo-Testnet blockchain for secure, instant micropayments between agents.
 
 ### Payment Flow
 
 1. **Price Discovery**: Agent queries service price
 2. **Payment Initiation**: Payment transaction is created
-3. **Confirmation**: Transaction is confirmed on Stellar
+3. **Confirmation**: Transaction is confirmed on 0G-Galileo-Testnet
 4. **Service Delivery**: Service is executed
 5. **Receipt**: Transaction receipt is provided
 
 ### Supported Currencies
 
-- **XLM**: Native Stellar token
-- **Other Assets**: USDC and other Stellar assets (coming soon)
+- **0G**: Native network token
+- **Other Assets**: ERC-20 assets (coming soon)
 
 ### Transaction Costs
 
-- Typical micropayment: 0.0001 - 0.01 XLM
-- Network fee: ~0.00001 XLM
+- Typical micropayment: 0.0001 - 0.01 0G
+- Network fee: network dependent gas fee
 - Settlement time: ~10 seconds
 
 ### Code Example
@@ -261,7 +261,7 @@ import { Payment } from '@mogause/agent-sdk';
 
 const payment = new Payment({
   amount: '0.001',
-  currency: 'XLM',
+  currency: '0G',
   recipient: 'SP2...',
 });
 

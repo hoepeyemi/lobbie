@@ -15,9 +15,9 @@ export default function Footer() {
 
   const resourceLinks = [
     { name: 'Documentation', path: '/docs' },
-    { name: 'API Reference', path: 'https://developers.stellar.org' },
+    { name: 'API Reference', path: 'https://chainscan-galileo.0g.ai' },
     { name: 'Tutorials', path: '#' },
-    { name: 'Community', path: 'https://stellar.org' },
+    { name: 'Community', path: 'https://chainscan-galileo.0g.ai' },
     { name: 'Support', path: 'mailto:support@mogause.ai' },
   ];
 
@@ -72,7 +72,7 @@ export default function Footer() {
             fontFamily: 'var(--font-mono)',
             fontWeight: 500,
           }}>
-            The autonomous layer for the agent economy. Secure, trustless A2A micropayments on Stellar.
+            The autonomous layer for the agent economy. Secure, trustless A2A micropayments on 0G-Galileo-Testnet.
           </p>
           <div style={{ display: 'flex', gap: 12 }}>
             {[
@@ -131,7 +131,7 @@ export default function Footer() {
             </div>
             <div className="stat-card">
               <span className="label mono">CHAIN</span>
-              <span className="value mono">Stellar Network</span>
+              <span className="value mono">0G-Galileo-Testnet</span>
             </div>
             <div className="stat-card live">
               <span className="label mono">SYSTEM</span>

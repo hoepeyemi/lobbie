@@ -954,11 +954,6 @@
   dependencies:
     "@noble/hashes" "2.0.1"
 
-"@noble/hashes@1.1.5", "@noble/hashes@^1.0.0", "@noble/hashes@^1.1.2":
-  version "1.1.5"
-  resolved "https://registry.npmjs.org/@noble/hashes/-/hashes-1.1.5.tgz"
-  integrity sha512-LTMZiiLc+V4v1Yi16TD6aX2gmtKszNye0pQgbaLqkvhIqP7nVsSaJsWloGQjJfJ8offaoP5GtX3yY5swbcJxxQ==
-
 "@noble/hashes@1.4.0":
   version "1.4.0"
   resolved "https://registry.npmjs.org/@noble/hashes/-/hashes-1.4.0.tgz"
@@ -984,10 +979,10 @@
   resolved "https://registry.npmjs.org/@noble/hashes/-/hashes-2.0.1.tgz"
   integrity sha512-XlOlEbQcE9fmuXxrVTXCTlG2nlRXa9Rj3rr5Ue/+tX+nmkgbX720YHh0VR3hBF9xDvwnb8D2shVGOwNx+ulArw==
 
-"@noble/secp256k1@1.7.1":
-  version "1.7.1"
-  resolved "https://registry.npmjs.org/@noble/secp256k1/-/secp256k1-1.7.1.tgz"
-  integrity sha512-hOUk6AyBFmqVrv7k5WAw/LpszxVbj9gGN4JRkIX52fdFAj1UA61KXmZDvqVEm+pOyec3+fIeZB02LYa/pWOArw==
+"@noble/hashes@^1.0.0":
+  version "1.1.5"
+  resolved "https://registry.npmjs.org/@noble/hashes/-/hashes-1.1.5.tgz"
+  integrity sha512-LTMZiiLc+V4v1Yi16TD6aX2gmtKszNye0pQgbaLqkvhIqP7nVsSaJsWloGQjJfJ8offaoP5GtX3yY5swbcJxxQ==
 
 "@nodelib/fs.scandir@2.1.5":
   version "2.1.5"
@@ -2214,34 +2209,6 @@
     rpc-websockets "^9.0.2"
     superstruct "^2.0.2"
 
-"@stacks/common@^6.16.0":
-  version "6.16.0"
-  resolved "https://registry.npmjs.org/@stacks/common/-/common-6.16.0.tgz"
-  integrity sha512-PnzvhrdGRMVZvxTulitlYafSK4l02gPCBBoI9QEoTqgSnv62oaOXhYAUUkTMFKxdHW1seVEwZsrahuXiZPIAwg==
-  dependencies:
-    "@types/bn.js" "^5.1.0"
-    "@types/node" "^18.0.4"
-
-"@stacks/network@^6.13.0", "@stacks/network@^6.17.0":
-  version "6.17.0"
-  resolved "https://registry.npmjs.org/@stacks/network/-/network-6.17.0.tgz"
-  integrity sha512-numHbfKjwco/rbkGPOEz8+FcJ2nBnS/tdJ8R422Q70h3SiA9eqk9RjSzB8p4JP8yW1SZvW+eihADHfMpBuZyfw==
-  dependencies:
-    "@stacks/common" "^6.16.0"
-    cross-fetch "^3.1.5"
-
-"@stacks/transactions@^6.13.0":
-  version "6.17.0"
-  resolved "https://registry.npmjs.org/@stacks/transactions/-/transactions-6.17.0.tgz"
-  integrity sha512-FUah2BRgV66ApLcEXGNGhwyFTRXqX5Zco3LpiM3essw8PF0NQlHwwdPgtDko5RfrJl3LhGXXe/30nwsfNnB3+g==
-  dependencies:
-    "@noble/hashes" "1.1.5"
-    "@noble/secp256k1" "1.7.1"
-    "@stacks/common" "^6.16.0"
-    "@stacks/network" "^6.17.0"
-    c32check "^2.0.0"
-    lodash.clonedeep "^4.5.0"
-
 "@stellar/freighter-api@6.0.0":
   version "6.0.0"
   resolved "https://registry.npmjs.org/@stellar/freighter-api/-/freighter-api-6.0.0.tgz"
@@ -2628,13 +2595,6 @@
   dependencies:
     tslib "^2.4.0"
 
-"@types/bn.js@^5.1.0":
-  version "5.2.0"
-  resolved "https://registry.npmjs.org/@types/bn.js/-/bn.js-5.2.0.tgz"
-  integrity sha512-DLbJ1BPqxvQhIGbeu8VbUC1DiAiahHtAYvA0ZEAa4P31F7IaArc8z3C3BRQdWX4mtLQuABG4yzp76ZrS02Ui1Q==
-  dependencies:
-    "@types/node" "*"
-
 "@types/body-parser@*":
   version "1.19.6"
   resolved "https://registry.npmjs.org/@types/body-parser/-/body-parser-1.19.6.tgz"
@@ -2938,7 +2898,7 @@
   resolved "https://registry.npmjs.org/@types/node/-/node-12.20.55.tgz"
   integrity sha512-J8xLz7q2OFulZ2cyGTLE1TbbZcjpno7FaN6zdJNrgAdrJ+DZzh/uFR6YrTb4C+nXakvud8Q4+rbhoIWlYQbUFQ==
 
-"@types/node@^18.0.4", "@types/node@^18.11.18":
+"@types/node@^18.11.18":
   version "18.19.130"
   resolved "https://registry.npmjs.org/@types/node/-/node-18.19.130.tgz"
   integrity sha512-GRaXQx6jGfL8sKfaIDD6OupbIHBr9jv7Jnaml9tB7l4v068PAOXqfcujMMo5PhbIs6ggR1XODELqahT2R8v0fg==
@@ -3815,7 +3775,7 @@ axios@1.13.6:
     form-data "^4.0.5"
     proxy-from-env "^1.1.0"
 
-axios@1.14.0, axios@^1.12.2, axios@^1.13.5, axios@^1.6.0, axios@^1.7.9:
+axios@1.14.0, axios@^1.12.2, axios@^1.13.5, axios@^1.7.9:
   version "1.14.0"
   resolved "https://registry.npmjs.org/axios/-/axios-1.14.0.tgz"
   integrity sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==
@@ -3840,11 +3800,6 @@ base-x@^3.0.2:
   integrity sha512-xz7wQ8xDhdyP7tQxwdteLYeFfS68tSMNCZ/Y37WJ4bhGfKPpqEIlmIyueQHqOyoPhE6xNUqjzRr8ra0eF9VRvA==
   dependencies:
     safe-buffer "^5.0.1"
-
-base-x@^4.0.0:
-  version "4.0.1"
-  resolved "https://registry.npmjs.org/base-x/-/base-x-4.0.1.tgz"
-  integrity sha512-uAZ8x6r6S3aUM9rbHGVOIsR15U/ZSc82b3ymnCPsT45Gk1DDvhDPdIgB5MrhirZWt+5K0EEPQH985kNqZgNPFw==
 
 base-x@^5.0.0:
   version "5.0.1"
@@ -4121,14 +4076,6 @@ bytes@~3.1.2:
   resolved "https://registry.npmjs.org/bytes/-/bytes-3.1.2.tgz"
   integrity sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg==
 
-c32check@^2.0.0:
-  version "2.0.0"
-  resolved "https://registry.npmjs.org/c32check/-/c32check-2.0.0.tgz"
-  integrity sha512-rpwfAcS/CMqo0oCqDf3r9eeLgScRE3l/xHDCXhM3UyrfvIn7PrLq63uHh7yYbv8NzaZn5MVsVhIRpQ+5GZ5HyA==
-  dependencies:
-    "@noble/hashes" "^1.1.2"
-    base-x "^4.0.0"
-
 call-bind-apply-helpers@^1.0.0, call-bind-apply-helpers@^1.0.1, call-bind-apply-helpers@^1.0.2:
   version "1.0.2"
   resolved "https://registry.npmjs.org/call-bind-apply-helpers/-/call-bind-apply-helpers-1.0.2.tgz"
@@ -4378,7 +4325,7 @@ create-hmac@^1.1.0, create-hmac@^1.1.7:
     safe-buffer "^5.0.1"
     sha.js "^2.4.8"
 
-cross-fetch@^3.1.4, cross-fetch@^3.1.5:
+cross-fetch@^3.1.4:
   version "3.2.0"
   resolved "https://registry.npmjs.org/cross-fetch/-/cross-fetch-3.2.0.tgz"
   integrity sha512-Q+xVJLoGOeIMXZmbUK4HYk+69cQH6LudR0Vu/pRm2YlU/hDV9CiS0gKUMaWY5f2NeUH9C1nV3bsTlCo0FsTV1Q==
@@ -6147,11 +6094,6 @@ locate-path@^6.0.0:
   dependencies:
     p-locate "^5.0.0"
 
-lodash.clonedeep@^4.5.0:
-  version "4.5.0"
-  resolved "https://registry.npmjs.org/lodash.clonedeep/-/lodash.clonedeep-4.5.0.tgz"
-  integrity sha512-H5ZhCF25riFd9uB5UCkVKo61m3S/xZk1x4wA6yp/L3RFP6Z/eHH1ymQcGLo7J3GMPfm0V/7m1tryHuGVxpqEBQ==
-
 lodash.merge@^4.6.2:
   version "4.6.2"
   resolved "https://registry.npmjs.org/lodash.merge/-/lodash.merge-4.6.2.tgz"
@@ -6573,6 +6515,20 @@ ox@0.14.13:
   version "0.14.13"
   resolved "https://registry.npmjs.org/ox/-/ox-0.14.13.tgz"
   integrity sha512-N3slDyEUq3qGw/53Xd8YZPZD7NUbbiOJDeWKvQ1ElNo2mFjjz6cV2TIbGenHw7k5ATcefDQh42dwUWoGtxU9Hg==
+  dependencies:
+    "@adraffy/ens-normalize" "^1.11.0"
+    "@noble/ciphers" "^1.3.0"
+    "@noble/curves" "1.9.1"
+    "@noble/hashes" "^1.8.0"
+    "@scure/bip32" "^1.7.0"
+    "@scure/bip39" "^1.6.0"
+    abitype "^1.2.3"
+    eventemitter3 "5.0.1"
+
+ox@0.14.20:
+  version "0.14.20"
+  resolved "https://registry.yarnpkg.com/ox/-/ox-0.14.20.tgz#b9ff923c88976508b63648fa7a01b6106cf71ff4"
+  integrity sha512-rby38C3nDn8eQkf29Zgw4hkCZJ64Qqi0zRPWL8ENUQ7JVuoITqrVtwWQgM/He19SCMUEc7hS/Sjw0jIOSLJhOw==
   dependencies:
     "@adraffy/ens-normalize" "^1.11.0"
     "@noble/ciphers" "^1.3.0"
@@ -8031,6 +7987,20 @@ viem@>=2.45.0, viem@^2.1.1, viem@^2.31.7, viem@^2.47.0:
     ox "0.14.13"
     ws "8.18.3"
 
+viem@latest:
+  version "2.48.4"
+  resolved "https://registry.yarnpkg.com/viem/-/viem-2.48.4.tgz#4de30b8564d26a7409559d812e9367213b2ec769"
+  integrity sha512-mReP/rgY2P+WeeRSG4sUvccCLKfyAW1C73Y3KkobAqgzYmVna9qyUMNE44xIUkDtfvRuC33r24UhF4baBYovsg==
+  dependencies:
+    "@noble/curves" "1.9.1"
+    "@noble/hashes" "1.8.0"
+    "@scure/bip32" "1.7.0"
+    "@scure/bip39" "1.6.0"
+    abitype "1.2.3"
+    isows "1.0.7"
+    ox "0.14.20"
+    ws "8.18.3"
+
 web-streams-polyfill@4.0.0-beta.3:
   version "4.0.0-beta.3"
   resolved "https://registry.npmjs.org/web-streams-polyfill/-/web-streams-polyfill-4.0.0-beta.3.tgz"
@@ -8158,15 +8128,6 @@ ws@^8.13.0, ws@^8.18.0, ws@^8.19.0, ws@^8.5.0:
   version "8.20.0"
   resolved "https://registry.npmjs.org/ws/-/ws-8.20.0.tgz"
   integrity sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA==
-
-x402-stacks@latest:
-  version "2.0.1"
-  resolved "https://registry.npmjs.org/x402-stacks/-/x402-stacks-2.0.1.tgz"
-  integrity sha512-/8tDDzzrsXLBsJptuaBo0qnC+qShBzHQSBRvWsTo/3JNyFLV8GaM9VytugG0cVb1zTQHYq3IJ11hE6/b+IdUpA==
-  dependencies:
-    "@stacks/network" "^6.13.0"
-    "@stacks/transactions" "^6.13.0"
-    axios "^1.6.0"
 
 x402-stellar@latest:
   version "0.2.0"

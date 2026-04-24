@@ -55,6 +55,10 @@ dotenv.config();
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const NETWORK = (process.env.STELLAR_NETWORK as 'stellar:testnet' | 'stellar:pubnet') || 'stellar:testnet';
+const NETWORK_NAME = process.env.NETWORK_NAME || '0G-Galileo-Testnet';
+const CHAIN_ID = process.env.CHAIN_ID || '16602';
+const TOKEN_SYMBOL = process.env.TOKEN_SYMBOL || '0G';
+const BLOCK_EXPLORER_BASE = (process.env.BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').trim().replace(/\/$/, '');
 const AGENT_PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY || process.env.MPP_SECRET_KEY;
 
 /** When true, missing or invalid on-chain settlement throws (surfaces payment pipeline bugs). */
@@ -89,12 +93,11 @@ function isStellarTransactionHash(value: unknown): value is string {
   return /^[0-9a-f]{64}$/.test(v);
 }
 
-/** Deep link to a transaction on StellarExpert (testnet or public network). */
+/** Deep link to a transaction on the configured explorer. */
 function stellarExpertTxUrl(txnHash: string): string | undefined {
   if (!isStellarTransactionHash(txnHash)) return undefined;
   const h = txnHash.trim().toLowerCase();
-  const net = NETWORK === 'stellar:pubnet' ? 'public' : 'testnet';
-  return `https://stellar.expert/explorer/${net}/tx/${h}`;
+  return `${BLOCK_EXPLORER_BASE}/tx/${h}`;
 }
 
 function resolveHorizonBaseUrl(): string {
@@ -159,9 +162,7 @@ async function finalizeExplorerLinksForTxHash(hash: string): Promise<ExplorerLin
 }
 
 const STELLAR_EXPERT_EXPLORER_HOME =
-  NETWORK === 'stellar:pubnet'
-    ? 'https://stellar.expert/explorer/public'
-    : 'https://stellar.expert/explorer/testnet';
+  BLOCK_EXPLORER_BASE;
 
 // Initialize Mppx Server for Charge Payments
 const mppx = Mppx.create({
@@ -2987,10 +2988,11 @@ app.listen(PORT, HOST, () => {
   console.log('');
   console.log('╔══════════════════════════════════════════════════════════════╗');
   console.log('║  mogause — x402 Autonomous Agent Economy                   ║');
-  console.log('║  Agent-to-Agent Micropayment Marketplace on Stellar        ║');
+  console.log('║  Agent-to-Agent Micropayment Marketplace on 0G Galileo     ║');
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log(`║  Server      : http://${HOST}:${PORT}`);
-  console.log(`║  Network     : ${NETWORK}`);
+  console.log(`║  Network     : ${NETWORK_NAME} (chain ${CHAIN_ID})`);
+  console.log(`║  Token       : ${TOKEN_SYMBOL}`);
   console.log('║  Protocol    : x402 (MPP)');
   console.log(`║  Agents      : ${agentRegistry.length} registered`);
   console.log('╠══════════════════════════════════════════════════════════════╣');
