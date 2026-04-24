@@ -59,6 +59,10 @@ const NETWORK_NAME = process.env.NETWORK_NAME || '0G-Galileo-Testnet';
 const CHAIN_ID = process.env.CHAIN_ID || '16602';
 const TOKEN_SYMBOL = process.env.TOKEN_SYMBOL || '0G';
 const BLOCK_EXPLORER_BASE = (process.env.BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').trim().replace(/\/$/, '');
+/** Deployed `AgentRegistry` on 0G-Galileo-Testnet (EVM). */
+const AGENT_REGISTRY_CONTRACT_ADDRESS =
+  (process.env.CONTRACT_ADDRESS || '').trim() || '0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D';
+const AGENT_REGISTRY_EXPLORER_URL = `${BLOCK_EXPLORER_BASE}/address/${AGENT_REGISTRY_CONTRACT_ADDRESS}`;
 const AGENT_PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY || process.env.MPP_SECRET_KEY;
 
 /** When true, missing or invalid on-chain settlement throws (surfaces payment pipeline bugs). */
@@ -347,7 +351,7 @@ function getDiscountedPrice(basePrice: number, reputation: number): number {
 const paymentLogs: PaymentLog[] = [];
 let paymentIdCounter = 0;
 
-// Internal L2 on-chain agent registry (synchronized with Stellar state)
+// In-memory marketplace listing (UX). On-chain source of truth for registry rules: `AGENT_REGISTRY_CONTRACT_ADDRESS` on 0G-Galileo-Testnet.
 const agentRegistry: AgentRegistryEntry[] = [
   // ── Universal Agent Adapter (External Agents) ──
   ...EXTERNAL_AGENTS.map(ext => ({
@@ -1057,6 +1061,10 @@ app.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     uptime: process.uptime(),
     network: NETWORK,
+    networkName: NETWORK_NAME,
+    chainId: CHAIN_ID,
+    contractAddress: AGENT_REGISTRY_CONTRACT_ADDRESS,
+    contractExplorerUrl: AGENT_REGISTRY_EXPLORER_URL,
     version: '2.0.0',
     agents: agentRegistry.length,
     totalPayments: paymentLogs.length,
@@ -1067,10 +1075,14 @@ app.get('/', (_req: Request, res: Response) => {
   res.json({
     name: 'mogause — x402 Autonomous Agent Economy',
     version: '2.0.0',
-    description: 'Agent-to-Agent micropayment marketplace on Stellar via x402',
+    description: 'Agent-to-Agent micropayment marketplace (x402); EVM agent registry on 0G-Galileo-Testnet',
     network: NETWORK,
+    networkName: NETWORK_NAME,
+    chainId: CHAIN_ID,
+    agentRegistryContract: AGENT_REGISTRY_CONTRACT_ADDRESS,
+    agentRegistryExplorer: AGENT_REGISTRY_EXPLORER_URL,
     protocol: 'x402 (HTTP 402 Payment Required)',
-    tokenSupport: ['XLM'],
+    tokenSupport: ['XLM', '0G'],
     features: [
       'Agent-to-Agent (A2A) recursive hiring',
       'On-chain reputation system',
@@ -1184,7 +1196,13 @@ app.get('/api/registry', (req: Request, res: Response) => {
     agents,
     count: agents.length,
     categories: [...new Set(agentRegistry.map(a => a.category))],
-    contractAddress: process.env.CONTRACT_ADDRESS || 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.agent-registry',
+    contractAddress: AGENT_REGISTRY_CONTRACT_ADDRESS,
+    contractExplorerUrl: AGENT_REGISTRY_EXPLORER_URL,
+    chainId: CHAIN_ID,
+    networkName: NETWORK_NAME,
+    tokenSymbol: TOKEN_SYMBOL,
+    blockExplorer: BLOCK_EXPLORER_BASE,
+    /** x402 / MPP settlement network id (Stellar) — distinct from the EVM registry chain above. */
     network: NETWORK,
   });
 });
@@ -1230,6 +1248,10 @@ app.get('/api/stats', (_req: Request, res: Response) => {
       .map(a => ({ name: a.name, reputation: a.reputation, jobs: a.jobsCompleted })),
     recentPayments: paymentLogs.slice(-10).reverse(),
     network: NETWORK,
+    contractAddress: AGENT_REGISTRY_CONTRACT_ADDRESS,
+    contractExplorerUrl: AGENT_REGISTRY_EXPLORER_URL,
+    chainId: CHAIN_ID,
+    networkName: NETWORK_NAME,
     uptime: process.uptime(),
   });
 });
@@ -2993,6 +3015,7 @@ app.listen(PORT, HOST, () => {
   console.log(`║  Server      : http://${HOST}:${PORT}`);
   console.log(`║  Network     : ${NETWORK_NAME} (chain ${CHAIN_ID})`);
   console.log(`║  Token       : ${TOKEN_SYMBOL}`);
+  console.log(`║  AgentRegistry (EVM): ${AGENT_REGISTRY_CONTRACT_ADDRESS}`);
   console.log('║  Protocol    : x402 (MPP)');
   console.log(`║  Agents      : ${agentRegistry.length} registered`);
   console.log('╠══════════════════════════════════════════════════════════════╣');

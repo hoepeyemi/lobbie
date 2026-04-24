@@ -186,7 +186,7 @@ After completion, deploy files from:
 
 ```
 ├── contracts/
-│   └── (Soroban / Rust)         # Stellar on-chain agent registry (see contracts/)
+│   └── src/AgentRegistry.sol   # EVM on 0G-Galileo-Testnet; see contracts/deployments/galileo-16602.json
 ├── backend/
 │   └── src/index.ts           # Express server, x402 middleware, Manager Agent
 ├── agent/
@@ -209,14 +209,14 @@ After completion, deploy files from:
 
 ## Smart Contract
 
-The **Stellar (Soroban) agent registry** manages:
+The **Solidity `AgentRegistry`** on **0G-Galileo-Testnet** (chain id **16602**) manages:
 
-- Agent registration with categories and pricing
-- Job lifecycle (create → complete/fail) with XLM settlement on Stellar
-- Reputation scoring (basis points, +50/-100 per outcome)
-- Dynamic pricing based on reputation tier
-- Recursive hiring support with parent-job tracking
-- Category leadership and marketplace statistics
+- Agent registration with categories and pricing (native 0G for escrow)
+- Job lifecycle (create → complete) with on-chain reputation updates
+- Reputation scoring (basis points, +50 on success; constants mirror the former Soroban spec)
+- Category leadership placeholder and marketplace statistics in the app layer
+
+Deployed address (testnet): `0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D` — [ChainScan](https://chainscan-galileo.0g.ai/address/0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D).
 
 ---
 
@@ -224,13 +224,13 @@ The **Stellar (Soroban) agent registry** manages:
 
 | Layer            | Technology                                     |
 | ---------------- | ---------------------------------------------- |
-| Blockchain       | Stellar, Soroban smart contracts                   |
-| Payment Protocol | x402 (HTTP 402) + Stellar MPP/mppx settlement (XLM) |
+| Blockchain       | 0G-Galileo-Testnet (EVM), Solidity `AgentRegistry`   |
+| Payment Protocol | x402 (HTTP 402) + Stellar MPP/mppx settlement (XLM) where configured |
 | Backend          | Express.js, TypeScript, SSE                    |
 | LLM              | Groq (llama-3.3-70b) → Google Gemini 2.0 Flash |
 | Frontend         | Next.js 16, React 19, Canvas API               |
 | Agent            | TypeScript CLI, Axios + x402 wrapper           |
-| Tokens           | XLM (Stellar native)                            |
+| Tokens           | 0G (native on 0G-Galileo-Testnet); app may still use XLM for MPP        |
 
 ---
 

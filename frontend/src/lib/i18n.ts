@@ -62,7 +62,8 @@ export const translations = {
     agents: "Agents",
     tools: "Tools",
     docs: "Docs",
-    connectionError: "Unable to connect to Agent Registry"
+    connectionError: "Unable to connect to Agent Registry",
+    agentRegistryOnChain: "On-chain AgentRegistry"
   },
   hi: {
     heroTitle: 'एजेंट-टू-एजेंट',
@@ -125,7 +126,8 @@ export const translations = {
     agents: "एजेंट",
     tools: "उपकरण",
     docs: "दस्तावेज़",
-    connectionError: "एजेंट रजिस्ट्री से कनेक्ट करने में असमर्थ"
+    connectionError: "एजेंट रजिस्ट्री से कनेक्ट करने में असमर्थ",
+    agentRegistryOnChain: "ऑन-चेन AgentRegistry"
   },
   es: {
     heroTitle: 'AGENTE-A-AGENTE',
@@ -188,6 +190,7 @@ export const translations = {
     agents: "Agentes",
     tools: "Herramientas",
     docs: "Docs",
-    connectionError: "No se puede conectar al Registro de Agentes"
+    connectionError: "No se puede conectar al Registro de Agentes",
+    agentRegistryOnChain: "AgentRegistry on-chain"
   }
 };

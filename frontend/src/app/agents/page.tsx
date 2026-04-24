@@ -11,6 +11,12 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'reputation' | 'efficiency' | 'price'>('reputation');
+  const [registryMeta, setRegistryMeta] = useState<{
+    contractAddress?: string;
+    contractExplorerUrl?: string;
+    chainId?: string;
+    networkName?: string;
+  }>({});
 
   useEffect(() => {
     const fetchAgents = async () => {
@@ -19,6 +25,12 @@ export default function AgentsPage() {
         if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
         const data = await res.json();
         setAgents(data.agents || []);
+        setRegistryMeta({
+          contractAddress: data.contractAddress,
+          contractExplorerUrl: data.contractExplorerUrl,
+          chainId: data.chainId,
+          networkName: data.networkName,
+        });
         setError(null);
       } catch (err: any) {
         console.error('Failed to fetch agents:', err);
@@ -44,6 +56,15 @@ export default function AgentsPage() {
     totalJobs: agents.reduce((acc, a) => acc + a.jobsCompleted, 0),
   };
 
+  const blockExplorerBase = (process.env.NEXT_PUBLIC_BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').replace(/\/$/, '');
+  const contractAddress =
+    registryMeta.contractAddress || process.env.NEXT_PUBLIC_AGENT_REGISTRY_ADDRESS || '';
+  const contractExplorerUrl =
+    registryMeta.contractExplorerUrl ||
+    (contractAddress ? `${blockExplorerBase}/address/${contractAddress}` : '');
+  const chainLabel = registryMeta.chainId || process.env.NEXT_PUBLIC_CHAIN_ID || '';
+  const networkLabel = registryMeta.networkName || process.env.NEXT_PUBLIC_NETWORK_NAME || '';
+
   return (
     <div style={{ padding: '40px 0' }}>
       <div style={{ marginBottom: 40, display: 'flex', justifyContent: 'space-between', alignItems: 'end' }}>
@@ -54,6 +75,24 @@ export default function AgentsPage() {
           <p style={{ fontSize: '1.1rem', color: '#111111', maxWidth: 700 }}>
             {t.marketplaceSubtitle}
           </p>
+          {contractAddress ? (
+            <p
+              className="mono"
+              style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 10, maxWidth: 900, lineHeight: 1.5 }}
+            >
+              <span style={{ marginRight: 8 }}>{t.agentRegistryOnChain}</span>
+              {networkLabel ? <span>{networkLabel} · </span> : null}
+              {chainLabel ? <span>chain {chainLabel} · </span> : null}
+              <a
+                href={contractExplorerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: 'var(--accent-primary)', wordBreak: 'break-all' }}
+              >
+                {contractAddress}
+              </a>
+            </p>
+          ) : null}
         </div>
 
         <div style={{ display: 'flex', gap: 12, marginBottom: 8 }}>

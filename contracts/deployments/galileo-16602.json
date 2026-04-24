@@ -1,0 +1,7 @@
+{
+  "networkName": "0G-Galileo-Testnet",
+  "chainId": 16602,
+  "contractName": "AgentRegistry",
+  "address": "0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D",
+  "blockExplorer": "https://chainscan-galileo.0g.ai"
+}
