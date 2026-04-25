@@ -1,7 +1,7 @@
 /**
  * Test Client — Manual verification that the backend endpoints work
  *
- * This script calls each paid endpoint using the Stellar SDK.
+ * This script calls backend endpoints; identity is the EVM address from AGENT_PRIVATE_KEY.
  *
  * Run: npx tsx agent/src/test-client.ts
  * Requires: AGENT_PRIVATE_KEY in .env and backend running on AGENT_SERVER_URL
@@ -9,7 +9,7 @@
 
 import axios from 'axios';
 import dotenv from 'dotenv';
-import StellarSdk from '@stellar/stellar-sdk';
+import { privateKeyToAccount } from 'viem/accounts';
 
 dotenv.config({ path: '../.env' });
 dotenv.config();
@@ -18,18 +18,24 @@ const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
 const SERVER_URL = process.env.AGENT_SERVER_URL || 'http://localhost:3001';
 
 if (!PRIVATE_KEY) {
-  console.error('AGENT_PRIVATE_KEY not set. Run: npx tsx src/generate-wallet.ts');
+  console.error('AGENT_PRIVATE_KEY not set. Run: npm run generate-wallet');
   process.exit(1);
 }
 
-const alice = StellarSdk.Keypair.fromSecret(PRIVATE_KEY);
+const raw = PRIVATE_KEY.trim();
+const h = raw.startsWith('0x') ? raw : `0x${raw}`;
+if (!/^0x[0-9a-fA-F]{64}$/.test(h)) {
+  console.error('AGENT_PRIVATE_KEY must be 64 hex chars (optional 0x).');
+  process.exit(1);
+}
+const account = privateKeyToAccount(h as `0x${string}`);
 
 console.log('');
 console.log('================================================================');
-console.log('  STELLAR TEST CLIENT');
+console.log('  BACKEND TEST CLIENT (EVM identity)');
 console.log('================================================================');
 console.log(`  Server : ${SERVER_URL}`);
-console.log(`  Payer  : ${alice.publicKey()}`);
+console.log(`  Payer  : ${account.address}`);
 console.log('================================================================');
 console.log('');
 

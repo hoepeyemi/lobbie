@@ -4,11 +4,11 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * An AI agent that:
- *   1. Discovers available paid Worker Agents from the Soroban Registry
+ *   1. Discovers available paid Worker Agents from the backend registry
  *   2. Accepts a user query (CLI or programmatic)
  *   3. Plans optimal delegation using LLM (Groq / Gemini)
  *   4. Autonomously evaluates cost vs. reputation before hiring
- *   5. Pays each Worker Agent via Stellar/Soroban on Stellar
+ *   5. Calls paid tools over HTTP (EVM identity via AGENT_PRIVATE_KEY; paid routes follow backend x402 / simulation rules)
  *   6. Handles recursive A2A hiring chains
  *   7. Aggregates results into a final answer
  *
@@ -17,8 +17,7 @@
 
 import axios, { AxiosInstance } from 'axios';
 import dotenv from 'dotenv';
-import StellarSdk from '@stellar/stellar-sdk';
-import { Mppx, stellar } from '@stellar/mpp/charge/client';
+import { privateKeyToAccount } from 'viem/accounts';
 import * as readline from 'readline';
 import Groq from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -30,9 +29,9 @@ dotenv.config();
 // Configuration
 // ═══════════════════════════════════════════════════════════════════════════
 
-const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
+const PRIVATE_KEY = (process.env.AGENT_PRIVATE_KEY || '').trim();
 const SERVER_URL = process.env.AGENT_SERVER_URL || 'http://localhost:3001';
-const NETWORK = (process.env.NETWORK as 'testnet' | 'mainnet') || 'testnet';
+const NETWORK = process.env.NETWORK || 'testnet';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -41,17 +40,24 @@ if (!PRIVATE_KEY) {
   process.exit(1);
 }
 
-// Stellar Setup
-const alice = StellarSdk.Keypair.fromSecret(PRIVATE_KEY);
+function parseEvmPrivateKeyHex(raw: string): `0x${string}` | null {
+  const s = raw.trim();
+  if (!s) return null;
+  const h = s.startsWith('0x') ? s : `0x${s}`;
+  return /^0x[0-9a-fA-F]{64}$/.test(h) ? (h as `0x${string}`) : null;
+}
 
-// Initialize MPP Client for automatic 402 handling
-Mppx.create({
-  methods: [
-    stellar.charge({
-      keypair: alice,
-    }),
-  ],
-});
+const EVM_KEY = parseEvmPrivateKeyHex(PRIVATE_KEY);
+if (!EVM_KEY) {
+  console.error(
+    '[AGENT] Invalid AGENT_PRIVATE_KEY. This agent uses an EVM private key: 64 hex characters, optional 0x prefix (same format as MetaMask / Hardhat).',
+  );
+  console.error('[AGENT] Generate one with: npm run generate-wallet');
+  process.exit(1);
+}
+
+const evmAccount = privateKeyToAccount(EVM_KEY);
+const BLOCK_EXPLORER = (process.env.BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').replace(/\/$/, '');
 
 const api: AxiosInstance = axios.create({ baseURL: SERVER_URL });
 
@@ -88,25 +94,8 @@ interface HiringDecision {
   alternatives: Tool[];
 }
 
-interface ToolCallResult {
-  tool: string;
-  agentName: string;
-  success: boolean;
-  data: any;
-  hiringReason: string;
-  payment?: {
-    transaction: string;
-    token: string;
-    amount: string;
-    explorerUrl: string;
-  };
-  subAgentHires?: any[];
-  error?: string;
-}
-
-// Note: The actual implementation of the agent logic (LLM planning, 
-// Soroban contract interaction, and result aggregation) would go here.
-// This replaces the x402-stellar specific logic with Stellar SDK logic.
+// Note: The actual implementation of the agent logic (LLM planning,
+// tool execution, and result aggregation) would go here.
 
 interface ToolCallResult {
   tool: string;
@@ -132,8 +121,8 @@ interface AgentPlan {
 }
 
 async function runAgent() {
-    console.log("mogause Stellar Agent initialized.");
-    console.log(`Wallet: ${alice.publicKey()}`);
+  console.log('mogause agent initialized.');
+  console.log(`Wallet (EVM): ${evmAccount.address}`);
 }
 
 runAgent().catch(console.error);
@@ -236,10 +225,9 @@ async function planToolCalls(query: string, tools: Tool[]): Promise<AgentPlan> {
     `- ID: "${t.id}" | Name: "${t.name}" | Cost: ${t.price.XLM} XLM | Rep: ${t.reputation}/100 | Cat: ${t.category} | ${t.canHireSubAgents ? 'CAN HIRE SUB-AGENTS' : 'Worker'}\n  Description: ${t.description}\n  Params: ${JSON.stringify(t.params)}`
   ).join('\n\n');
 
-  const systemPrompt = `You are the MANAGER AGENT of mogause — an autonomous AI economy on Stellar blockchain.
+  const systemPrompt = `You are the MANAGER AGENT of mogause — an autonomous multi-agent system backed by a backend registry and payments.
 
-You have a BUDGET and must hire Worker Agents via Soroban micropayments.
-Each hire costs real XLM tokens on the Stellar blockchain.
+You have a BUDGET and must hire Worker Agents. Pricing is shown in XLM-equivalent fields from the tool registry; actual settlement follows the server configuration.
 
 Available Worker Agents:
 ${toolsDescription}
@@ -382,7 +370,7 @@ async function executeTool(
             transaction: paymentInfo,
             token,
             amount: `${tool.price.XLM} XLM`,
-            explorerUrl: `https://stellar.expert/explorer/testnet/${paymentInfo}`,
+            explorerUrl: `${BLOCK_EXPLORER}/tx/${paymentInfo}`,
           };
           console.log(`[AGENT] [OK] Paid ${tool.price.XLM} XLM | tx: ${paymentInfo}`);
         }
@@ -436,7 +424,7 @@ async function executeTool(
             transaction: fallbackPaymentInfo,
             token,
             amount: `${fallback.price.XLM} XLM`,
-            explorerUrl: `https://stellar.expert/explorer/testnet/${fallbackPaymentInfo}`,
+            explorerUrl: `${BLOCK_EXPLORER}/tx/${fallbackPaymentInfo}`,
           };
           console.log(`[AGENT] [SELF-HEAL] Recovered via ${fallback.name} | Paid ${fallback.price.XLM} XLM`);
         }
@@ -585,10 +573,10 @@ async function startRepl() {
   console.log('');
   console.log('╔══════════════════════════════════════════════════════════════╗');
   console.log('║              mogause — x402 AUTONOMOUS AGENT                ║');
-  console.log('║           Agent-to-Agent Economy on Stellar                  ║');
+  console.log('║              EVM identity (0G / backend tools)              ║');
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log(`║  Server  : ${SERVER_URL.padEnd(49)}║`);
-  console.log(`║  Wallet  : ${alice.publicKey().padEnd(49)}║`);
+  console.log(`║  Wallet  : ${evmAccount.address.padEnd(49)}║`);
   console.log(`║  Network : ${NETWORK.padEnd(49)}║`);
   console.log(`║  LLM     : ${(groqClient ? 'Groq (llama-3.3-70b)' : geminiClient ? 'Gemini' : 'Rule-based').padEnd(49)}║`);
   console.log('╠══════════════════════════════════════════════════════════════╣');
