@@ -38,6 +38,7 @@
     "viem": "latest"
   },
   "devDependencies": {
+    "@types/body-parser": "^1.19.6",
     "@types/http-errors": "^2.0.5",
     "tsx": "^4.19.0"
   },
