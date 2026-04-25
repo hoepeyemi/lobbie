@@ -1,142 +1,97 @@
 'use client';
 
-import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
-import { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit/sdk";
-import { SwkAppDarkTheme } from "@creit.tech/stellar-wallets-kit/types";
-import { defaultModules } from "@creit.tech/stellar-wallets-kit/modules/utils";
-import { KitEventType, Networks } from "@creit.tech/stellar-wallets-kit/types";
-import * as StellarSdk from "@stellar/stellar-sdk";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useState,
+  type ReactNode,
+} from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { WagmiProvider, useAccount, useDisconnect } from 'wagmi';
+import { useConnectModal, RainbowKitProvider, darkTheme } from '@rainbow-me/rainbowkit';
+import { wagmiConfig } from './wagmiConfig';
 
-interface WalletContextType {
+export interface WalletContextType {
   address: string | null;
-  connect: () => Promise<void>;
+  connect: () => void;
   disconnect: () => void;
+  /**
+   * Stellar / legacy — not used on EVM. Keep for call sites; prefer wagmi + viem for txs.
+   */
   signTransaction: (transactionXdr: string) => Promise<string>;
   isConnected: boolean;
+  chainId: number | null;
 }
-export type { WalletContextType };
+
 const WalletContext = createContext<WalletContextType | null>(null);
 
-export function WalletProvider({ children }: { children: React.ReactNode }) {
-  const [address, setAddress] = useState<string | null>(null);
-  const [mounted, setMounted] = useState(false);
+function WalletStateBridge({ children }: { children: ReactNode }) {
+  const { address, isConnected, chainId } = useAccount();
+  const { disconnect } = useDisconnect();
+  const { openConnectModal } = useConnectModal();
 
-  useEffect(() => {
-    // Initialize the kit on mount (client-side only)
-    const initializeKit = async () => {
-      try {
-        // Initialize StellarWalletsKit
-        StellarWalletsKit.init({
-          theme: SwkAppDarkTheme,
-          modules: defaultModules(),
-          network: Networks.TESTNET,
-        });
+  const connect = useCallback(() => {
+    openConnectModal?.();
+  }, [openConnectModal]);
 
-        // Try to restore previous connection
-        try {
-          const { address: savedAddress } = await StellarWalletsKit.getAddress();
-          if (savedAddress) {
-            setAddress(savedAddress);
-          }
-        } catch {
-          // No previous connection, that's fine
-        }
-
-        // Listen for address changes
-        const unsubscribe = StellarWalletsKit.on(
-          KitEventType.STATE_UPDATED,
-          (event: any) => {
-            if (event.payload?.address) {
-              setAddress(event.payload.address);
-            }
-          }
-        );
-
-        // Listen for disconnects
-        const unsubscribeDisconnect = StellarWalletsKit.on(
-          KitEventType.DISCONNECT,
-          () => {
-            setAddress(null);
-          }
-        );
-
-        setMounted(true);
-
-        return () => {
-          unsubscribe();
-          unsubscribeDisconnect();
-        };
-      } catch (error) {
-        console.error("Failed to initialize StellarWalletsKit:", error);
-        setMounted(true);
-      }
-    };
-
-    initializeKit();
+  const signTransaction = useCallback(async (_transactionXdr: string) => {
+    throw new Error(
+      'EVM mode: Stellar XDR signing is not available. Use wagmi (useWalletClient, useSendTransaction) or viem with the connected account.',
+    );
   }, []);
 
-  const connect = useCallback(async () => {
-    try {
-      const { address } = await StellarWalletsKit.authModal();
-      setAddress(address);
-    } catch (error) {
-      console.error("Connection failed:", error);
-    }
-  }, []);
+  const value: WalletContextType = {
+    address: address ?? null,
+    connect,
+    disconnect: () => disconnect(),
+    signTransaction,
+    isConnected: Boolean(isConnected && address),
+    chainId: chainId ?? null,
+  };
 
-  const disconnect = useCallback(() => {
-    setAddress(null);
-    try {
-      StellarWalletsKit.disconnect();
-    } catch (error) {
-      console.error("Disconnect failed:", error);
-    }
-  }, []);
+  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
+}
 
-  const signTransaction = useCallback(async (transactionXdr: string): Promise<string> => {
-    if (!address) {
-      throw new Error('Wallet not connected');
-    }
+export function WalletProvider({ children }: { children: ReactNode }) {
+  const [queryClient] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: { refetchOnWindowFocus: false },
+        },
+      }),
+  );
 
-    try {
-      const result = await StellarWalletsKit.signTransaction(transactionXdr, {
-        address,
-        networkPassphrase: StellarSdk.Networks.TESTNET,
-      });
-      
-      // Handle both string and object return types
-      if (typeof result === 'string') {
-        return result;
-      }
-      // If result is an object, extract the signedTxXdr property
-      if (result && typeof result === 'object' && 'signedTxXdr' in result) {
-        return (result as { signedTxXdr: string }).signedTxXdr;
-      }
-      // Fallback: return empty string if no valid result
-      return '';
-    } catch (error) {
-      console.error("Transaction signing failed:", error);
-      throw error;
-    }
-  }, [address]);
+  if (process.env.NODE_ENV === 'development' && !process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID?.trim()) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[mogause] Set NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID in .env (https://cloud.walletconnect.com) for WalletConnect. Browser wallets may still work.',
+    );
+  }
 
   return (
-    <WalletContext.Provider value={{ 
-      address, 
-      connect, 
-      disconnect,
-      signTransaction,
-      isConnected: !!address 
-    }}>
-      {children}
-    </WalletContext.Provider>
+    <WagmiProvider config={wagmiConfig}>
+      <QueryClientProvider client={queryClient}>
+        <RainbowKitProvider
+          theme={darkTheme({
+            accentColor: '#FF854B',
+            accentColorForeground: 'white',
+            borderRadius: 'small',
+            fontStack: 'system',
+          })}
+        >
+          <WalletStateBridge>{children}</WalletStateBridge>
+        </RainbowKitProvider>
+      </QueryClientProvider>
+    </WagmiProvider>
   );
 }
 
 export const useWallet = () => {
   const context = useContext(WalletContext);
   if (!context) {
-    throw new Error("useWallet must be used within WalletProvider");
+    throw new Error('useWallet must be used within WalletProvider');
   }
   return context;
 };

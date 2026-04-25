@@ -9,6 +9,13 @@ const nextConfig = {
   },
   // Monorepo: silence "multiple lockfiles" / wrong workspace root during build
   outputFileTracingRoot: path.join(__dirname, '..'),
+  /** Wallet stack may live in the workspace root `node_modules`. */
+  transpilePackages: [
+    '@rainbow-me/rainbowkit',
+    'wagmi',
+    'viem',
+    '@tanstack/react-query',
+  ],
 };
 
 module.exports = nextConfig;

@@ -38,6 +38,7 @@
     "viem": "latest"
   },
   "devDependencies": {
+    "@types/http-errors": "^2.0.5",
     "tsx": "^4.19.0"
   },
   "engines": {

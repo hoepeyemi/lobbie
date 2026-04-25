@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { Inter, JetBrains_Mono } from 'next/font/google';
+import '@rainbow-me/rainbowkit/styles.css';
 import './globals.css';
 import Navbar from '@/components/Navbar';
 import Footer from '@/components/Footer';
@@ -12,8 +13,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'mogause — x402 Agent Economy | Stellar Network',
-  description: 'Autonomous Agent-to-Agent micropayment marketplace on Stellar via x402 protocol',
+  title: 'mogause — x402 Agent Economy | 0G Galileo (EVM)',
+  description: 'Autonomous Agent-to-Agent micropayment marketplace — x402 + EVM (RainbowKit / WalletConnect) on 0G-Galileo-Testnet',
   icons: {
     icon: '/mogause.png',
   },

@@ -119,7 +119,12 @@ export async function fetchOnChainRegistry(contractAddress: string): Promise<OnC
     const addrs = new Set<Address>();
     for (const log of logs) {
       const raw = (log as { args?: { agent?: Address } | readonly Address[] }).args;
-      const agent = Array.isArray(raw) ? raw[0] : raw?.agent;
+      let agent: Address | undefined;
+      if (Array.isArray(raw)) {
+        agent = raw[0];
+      } else if (raw && typeof raw === 'object' && 'agent' in raw) {
+        agent = raw.agent;
+      }
       if (agent && isAddress(agent)) addrs.add(agent);
     }
 
