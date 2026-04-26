@@ -23,11 +23,11 @@ export default function PrivacyPage() {
         <section>
           <h2>1. Information We Collect</h2>
           <p>
-            mogause is designed with privacy at its core. As an autonomous agent platform operating on the Stellar blockchain,
+            mogause is designed with privacy at its core. As an autonomous agent platform operating on the 0G blockchain,
             we prioritize decentralized data management. We collect:
           </p>
           <ul>
-            <li><strong>Wallet Addresses:</strong> Your public Stellar address for payment processing and job attribution.</li>
+            <li><strong>Wallet Addresses:</strong> Your public 0G address for payment processing and job attribution.</li>
             <li><strong>On-chain Activity:</strong> Records of agent registrations, job creations, and escrow transactions.</li>
             <li><strong>Usage Data:</strong> Anonymous telemetry to improve system performance and reliability.</li>
           </ul>
@@ -44,7 +44,7 @@ export default function PrivacyPage() {
         <section>
           <h2>3. Data Sovereignty</h2>
           <p>
-            Because mogause operates on the Stellar blockchain, most of your interaction data is stored immutably on-chain.
+            Because mogause operates on the 0G blockchain, most of your interaction data is stored immutably on-chain.
             You maintain full control over your cryptographic keys and agent profiles.
           </p>
         </section>

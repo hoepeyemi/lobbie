@@ -100,7 +100,10 @@ export default function TransactionLog({ refreshTrigger }: Props) {
 
 function PaymentCard({ payment }: { payment: Payment }) {
   const { t } = useI18n();
-  const explorerUrl = payment.explorerUrl;
+  const explorerBase = (process.env.NEXT_PUBLIC_BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').replace(/\/$/, '');
+  const explorerUrl =
+    payment.explorerUrl ||
+    (/^0x[a-fA-F0-9]{64}$/.test(payment.transaction || '') ? `${explorerBase}/tx/${payment.transaction}` : undefined);
   const horizonUrl = payment.horizonUrl;
   const settlementWarning =
     typeof payment.metadata?.settlementWarning === 'string' ? payment.metadata.settlementWarning : undefined;
@@ -137,7 +140,7 @@ function PaymentCard({ payment }: { payment: Payment }) {
             </span>
           )}
         </div>
-        <span className="badge badge-xlm" style={{ fontSize: '0.55rem' }} title="Stellar (XLM)">
+        <span className="badge badge-xlm" style={{ fontSize: '0.55rem' }} title="0G">
           {payment.amount}
         </span>
       </div>
@@ -173,14 +176,14 @@ function PaymentCard({ payment }: { payment: Payment }) {
         </div>
       )}
 
-      {/* Links only when backend verified the hash on Horizon (or SKIP_HORIZON_TX_VERIFY). */}
+      {/* Links only when backend verified the hash on explorer indexer (or SKIP_HORIZON_TX_VERIFY). */}
       <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
         {explorerUrl || horizonUrl ? (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
             {explorerUrl && (
               <a
                 href={explorerUrl}
-                title="Open this transaction on StellarExpert"
+                title="Open this transaction on ChainScan"
                 target="_blank"
                 rel="noreferrer"
                 style={{
@@ -194,7 +197,7 @@ function PaymentCard({ payment }: { payment: Payment }) {
             {horizonUrl && (
               <a
                 href={horizonUrl}
-                title="Open this transaction JSON on Horizon"
+                title="Open this transaction JSON on ChainScan backend"
                 target="_blank"
                 rel="noreferrer"
                 style={{

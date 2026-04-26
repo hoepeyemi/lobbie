@@ -100,7 +100,7 @@ const SubAgentTree = ({ hires, depth = 0 }: { hires: any[], depth?: number }) =>
                 <Icon size={14} />
               </div>
               <span className="mono">Hired <strong style={{ color: color }}>{hire.agent}</strong></span>
-              <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>— {hire.cost} {hire.currency || 'XLM'}</span>
+              <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>— {hire.cost} {hire.currency || '0G'}</span>
             </div>
 
             {hire.subAgentHires && hire.subAgentHires.length > 0 && (
@@ -213,7 +213,7 @@ export default function AgentChat({ onNewPayments, onProtocolTrace }: Params) {
 
           setMessages(prev => [...prev, {
             role: 'system',
-            content: `🔄 **Recursive Hire:** ${data.hirer} hired **${data.worker}** for ${data.cost} XLM.`,
+            content: `🔄 **Recursive Hire:** ${data.hirer} hired **${data.worker}** for ${data.cost} 0G.`,
             depth: data.depth || 1
           }]);
         } catch (e) { console.error('SSE A2A Error:', e); }
@@ -516,7 +516,7 @@ export default function AgentChat({ onNewPayments, onProtocolTrace }: Params) {
                     fontSize: '0.75rem'
                   }} className="mono">
                     <DollarSign size={12} />
-                    <span>COST: {msg.cost} XLM</span>
+                    <span>COST: {msg.cost} 0G</span>
                   </div>
                 )}
               </div>

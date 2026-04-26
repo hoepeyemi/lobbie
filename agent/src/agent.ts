@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * mogause — Autonomous Stellar Agent (CLI + Programmatic)
+ * mogause — Autonomous 0G Agent (CLI + Programmatic)
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * An AI agent that:
@@ -77,7 +77,7 @@ interface Tool {
   name: string;
   endpoint: string;
   method: string;
-  price: { XLM: number };
+  price: { '0G'?: number };
   category: string;
   params: Record<string, string>;
   description: string;
@@ -93,6 +93,8 @@ interface HiringDecision {
   costEfficiency: number;
   alternatives: Tool[];
 }
+
+function price0G(tool: Tool): number { return Number(tool.price?.['0G'] ?? 0); }
 
 // Note: The actual implementation of the agent logic (LLM planning,
 // tool execution, and result aggregation) would go here.
@@ -147,11 +149,9 @@ async function discoverTools(): Promise<Tool[]> {
     console.log(`[AGENT] [OK] Found ${availableTools.length} Worker Agents:`);
     availableTools.forEach(t => {
       const subLabel = t.canHireSubAgents ? ' [A2A-ENABLED]' : '';
-      const priceXLM = typeof t.price === 'object' && t.price.XLM !== undefined 
-        ? t.price.XLM.toString() 
-        : (t.price || '0').toString();
+      const price = price0G(t).toString();
       console.log(
-        `  ├─ ${t.name.padEnd(22)} ${priceXLM.padEnd(6)} XLM | Rep: ${t.reputation}/100 | Jobs: ${t.jobsCompleted}${subLabel}`
+        `  ├─ ${t.name.padEnd(22)} ${price.padEnd(6)} 0G | Rep: ${t.reputation}/100 | Jobs: ${t.jobsCompleted}${subLabel}`
       );
     });
     return availableTools;
@@ -171,8 +171,8 @@ async function discoverTools(): Promise<Tool[]> {
  */
 function evaluateWorkers(tools: Tool[]): Tool[] {
   return tools.sort((a, b) => {
-    const scoreA = (a.reputation * a.reputation) / (a.price.XLM * 10000 || 1);
-    const scoreB = (b.reputation * b.reputation) / (b.price.XLM * 10000 || 1);
+    const scoreA = (a.reputation * a.reputation) / (price0G(a) * 10000 || 1);
+    const scoreB = (b.reputation * b.reputation) / (price0G(b) * 10000 || 1);
     return scoreB - scoreA;
   });
 }
@@ -190,27 +190,29 @@ function makeHiringDecision(toolId: string, tools: Tool[]): HiringDecision | nul
     .filter(t => t.category === tool.category && t.id !== toolId && t.reputation >= 50)
     .sort((a, b) => b.reputation - a.reputation);
 
-  const costEfficiency = tool.price.XLM > 0
-    ? Math.round((tool.reputation * tool.reputation) / (tool.price.XLM * 10000))
+  const toolPrice = price0G(tool);
+  const costEfficiency = toolPrice > 0
+    ? Math.round((tool.reputation * tool.reputation) / (toolPrice * 10000))
     : 0;
 
   let reason: string;
   if (alternatives.length > 0) {
     const alt = alternatives[0];
-    const altEfficiency = alt.price.XLM > 0
-      ? Math.round((alt.reputation * alt.reputation) / (alt.price.XLM * 10000))
+    const altPrice = price0G(alt);
+    const altEfficiency = altPrice > 0
+      ? Math.round((alt.reputation * alt.reputation) / (altPrice * 10000))
       : 0;
 
     if (costEfficiency >= altEfficiency) {
       reason = `Selected ${tool.name} (Efficiency: ${costEfficiency}) over ${alt.name} (Efficiency: ${altEfficiency}). ` +
-        `Reason: Better cost-reputation ratio at ${tool.price.XLM} XLM with ${tool.reputation}/100 reputation.`;
+        `Reason: Better cost-reputation ratio at ${toolPrice} 0G with ${tool.reputation}/100 reputation.`;
     } else {
-      reason = `Selected ${tool.name} (Cost: ${tool.price.XLM} XLM, Rep: ${tool.reputation}/100) — ` +
+      reason = `Selected ${tool.name} (Cost: ${toolPrice} 0G, Rep: ${tool.reputation}/100) — ` +
         `specific capability match. ${alt.name} had higher efficiency but different specialization.`;
     }
   } else {
     reason = `Hiring ${tool.name}: Only available specialist in "${tool.category}" category. ` +
-      `Cost: ${tool.price.XLM} XLM, Rep: ${tool.reputation}/100.`;
+      `Cost: ${toolPrice} 0G, Rep: ${tool.reputation}/100.`;
   }
 
   return { tool, reason, costEfficiency, alternatives };
@@ -222,12 +224,12 @@ function makeHiringDecision(toolId: string, tools: Tool[]): HiringDecision | nul
 
 async function planToolCalls(query: string, tools: Tool[]): Promise<AgentPlan> {
   const toolsDescription = tools.map(t =>
-    `- ID: "${t.id}" | Name: "${t.name}" | Cost: ${t.price.XLM} XLM | Rep: ${t.reputation}/100 | Cat: ${t.category} | ${t.canHireSubAgents ? 'CAN HIRE SUB-AGENTS' : 'Worker'}\n  Description: ${t.description}\n  Params: ${JSON.stringify(t.params)}`
+    `- ID: "${t.id}" | Name: "${t.name}" | Cost: ${price0G(t)} 0G | Rep: ${t.reputation}/100 | Cat: ${t.category} | ${t.canHireSubAgents ? 'CAN HIRE SUB-AGENTS' : 'Worker'}\n  Description: ${t.description}\n  Params: ${JSON.stringify(t.params)}`
   ).join('\n\n');
 
   const systemPrompt = `You are the MANAGER AGENT of mogause — an autonomous multi-agent system backed by a backend registry and payments.
 
-You have a BUDGET and must hire Worker Agents. Pricing is shown in XLM-equivalent fields from the tool registry; actual settlement follows the server configuration.
+You have a BUDGET and must hire Worker Agents. Pricing is shown in 0G-equivalent fields from the tool registry; actual settlement follows the server configuration.
 
 Available Worker Agents:
 ${toolsDescription}
@@ -329,7 +331,7 @@ function fallbackPlan(query: string, tools: Tool[]): AgentPlan {
 async function executeTool(
   toolId: string,
   params: Record<string, any>,
-  token: 'XLM' = 'XLM'
+  token: '0G' = '0G'
 ): Promise<ToolCallResult> {
   const startTime = Date.now();
   const hiring = makeHiringDecision(toolId, availableTools);
@@ -348,7 +350,8 @@ async function executeTool(
 
   const { tool, reason } = hiring;
 
-  console.log(`[AGENT] [PAY] Hiring ${tool.name} (${tool.price.XLM} XLM, Rep: ${tool.reputation}/100)`);
+  const toolPrice = price0G(tool);
+  console.log(`[AGENT] [PAY] Hiring ${tool.name} (${toolPrice} 0G, Rep: ${tool.reputation}/100)`);
   console.log(`[AGENT] [NOTE] Reason: ${reason}`);
 
   try {
@@ -369,10 +372,10 @@ async function executeTool(
           result.payment = {
             transaction: paymentInfo,
             token,
-            amount: `${tool.price.XLM} XLM`,
+            amount: `${toolPrice} 0G`,
             explorerUrl: `${BLOCK_EXPLORER}/tx/${paymentInfo}`,
           };
-          console.log(`[AGENT] [OK] Paid ${tool.price.XLM} XLM | tx: ${paymentInfo}`);
+          console.log(`[AGENT] [OK] Paid ${toolPrice} 0G | tx: ${paymentInfo}`);
         }
 
         // Track sub-agent hires from recursive agents
@@ -403,7 +406,8 @@ async function executeTool(
     for (let retry = 0; retry < Math.min(MAX_RETRIES, alternatives.length); retry++) {
       const fallback = alternatives[retry];
       console.log(`[AGENT] [SELF-HEAL] Attempt ${retry + 1}: Switching from ${tool.name} to ${fallback.name}`);
-      console.log(`[AGENT] [SELF-HEAL] Fallback: ${fallback.name} (Rep: ${fallback.reputation}, Cost: ${fallback.price.XLM} XLM)`);
+      const fallbackPrice = price0G(fallback);
+      console.log(`[AGENT] [SELF-HEAL] Fallback: ${fallback.name} (Rep: ${fallback.reputation}, Cost: ${fallbackPrice} 0G)`);
 
       try {
         const fallbackRes = await api.post(`${fallback.endpoint}?token=${token}`, params);
@@ -423,10 +427,10 @@ async function executeTool(
           healedResult.payment = {
             transaction: fallbackPaymentInfo,
             token,
-            amount: `${fallback.price.XLM} XLM`,
+            amount: `${fallbackPrice} 0G`,
             explorerUrl: `${BLOCK_EXPLORER}/tx/${fallbackPaymentInfo}`,
           };
-          console.log(`[AGENT] [SELF-HEAL] Recovered via ${fallback.name} | Paid ${fallback.price.XLM} XLM`);
+          console.log(`[AGENT] [SELF-HEAL] Recovered via ${fallback.name} | Paid ${fallbackPrice} 0G`);
         }
 
         return healedResult;
@@ -454,7 +458,7 @@ async function executeTool(
 
 async function processQuery(
   query: string,
-  token: 'XLM' = 'XLM'
+  token: '0G' = '0G'
 ): Promise<{
   query: string;
   plan: AgentPlan;
@@ -501,16 +505,16 @@ async function processQuery(
 
     const tool = availableTools.find(t => t.id === call.toolId);
     if (result.success && tool) {
-      totalCost += tool.price.XLM;
+      totalCost += price0G(tool);
       hiringDecisions.push({
         agent: result.agentName,
         reason: result.hiringReason,
-        cost: tool.price.XLM,
+        cost: price0G(tool),
       });
 
       // Account for sub-agent costs
       if (result.data?.totalCostIncludingSubAgents) {
-        const subCost = result.data.totalCostIncludingSubAgents - tool.price.XLM;
+        const subCost = result.data.totalCostIncludingSubAgents - price0G(tool);
         a2aCost += subCost;
         totalCost += subCost;
         a2aDepth = Math.max(a2aDepth, result.data.recursiveDepth || 0);
@@ -522,7 +526,7 @@ async function processQuery(
   const finalAnswer = await synthesizeAnswer(query, results);
 
   console.log('');
-  console.log(`[AGENT] [PAY] Total cost: ${totalCost.toFixed(4)} XLM (incl. ${a2aCost.toFixed(4)} XLM A2A)`);
+  console.log(`[AGENT] [PAY] Total cost: ${totalCost.toFixed(4)} 0G (incl. ${a2aCost.toFixed(4)} 0G A2A)`);
   console.log(`[AGENT] [A2A] Depth: ${a2aDepth}`);
   console.log(`[AGENT] [OK] Final: ${finalAnswer.slice(0, 200)}...`);
 
@@ -609,7 +613,7 @@ async function startRepl() {
         console.log('\n┌─ Available Worker Agents ─────────────────────────────────┐');
         for (const t of availableTools) {
           const sub = t.canHireSubAgents ? ' [A2A]' : '   ';
-          console.log(`│ ${t.name.padEnd(22)} ${t.price.XLM.toString().padEnd(7)} XLM | Rep: ${t.reputation.toString().padEnd(3)}/100 | ${t.category}${sub} │`);
+          console.log(`│ ${t.name.padEnd(22)} ${price0G(t).toString().padEnd(7)} 0G | Rep: ${t.reputation.toString().padEnd(3)}/100 | ${t.category}${sub} │`);
         }
         console.log('└───────────────────────────────────────────────────────────┘');
         prompt();
@@ -624,7 +628,7 @@ async function startRepl() {
             | undefined;
           console.log('\n┌─ Marketplace agents (x402 / backend) ────────────────────┐');
           for (const a of res.data.agents) {
-            console.log(`│ ${a.name.padEnd(22)} Rep: ${a.reputation.toString().padEnd(3)}/100 | Jobs: ${a.jobsCompleted.toString().padEnd(5)} | Earned: ${a.totalEarned.toFixed(1)} XLM │`);
+            console.log(`│ ${a.name.padEnd(22)} Rep: ${a.reputation.toString().padEnd(3)}/100 | Jobs: ${a.jobsCompleted.toString().padEnd(5)} | Earned: ${a.totalEarned.toFixed(1)} 0G │`);
           }
           console.log('└───────────────────────────────────────────────────────────┘');
           if (oc?.error) {
@@ -662,7 +666,7 @@ async function startRepl() {
 
       if (trimmed === 'demo') {
         console.log('[AGENT] [DEMO] Running multi-agent demo...');
-        await processQuery('Research the x402 protocol on Stellar, summarize the findings, and check the weather in Tokyo');
+        await processQuery('Research the x402 protocol on 0G, summarize the findings, and check the weather in Tokyo');
         prompt();
         return;
       }

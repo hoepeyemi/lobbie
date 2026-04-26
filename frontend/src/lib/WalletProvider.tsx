@@ -17,7 +17,7 @@ export interface WalletContextType {
   connect: () => void;
   disconnect: () => void;
   /**
-   * Stellar / legacy — not used on EVM. Keep for call sites; prefer wagmi + viem for txs.
+   * 0G / legacy — not used on EVM. Keep for call sites; prefer wagmi + viem for txs.
    */
   signTransaction: (transactionXdr: string) => Promise<string>;
   isConnected: boolean;
@@ -37,7 +37,7 @@ function WalletStateBridge({ children }: { children: ReactNode }) {
 
   const signTransaction = useCallback(async (_transactionXdr: string) => {
     throw new Error(
-      'EVM mode: Stellar XDR signing is not available. Use wagmi (useWalletClient, useSendTransaction) or viem with the connected account.',
+      'EVM mode: 0G XDR signing is not available. Use wagmi (useWalletClient, useSendTransaction) or viem with the connected account.',
     );
   }, []);
 

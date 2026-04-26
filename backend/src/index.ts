@@ -4,7 +4,7 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * A production-grade backend that implements:
- *   - x402 payment-gated endpoints (XLM on Stellar)
+ *   - x402 payment-gated endpoints (0G on 0G)
  *   - Agent-to-Agent (A2A) recursive hiring
  *   - On-chain agent registry integration
  *   - Real-time SSE for live dashboard updates
@@ -12,14 +12,14 @@
  *   - LLM-powered autonomous task planning (Groq + Gemini fallback)
  *
  * Endpoints (Paid):
- *   POST /api/weather           — Weather lookup       (0.001 XLM)
- *   POST /api/summarize         — Text summarization   (0.003 XLM)
- *   POST /api/math-solve        — Math solver           (0.005 XLM)
- *   POST /api/sentiment         — Sentiment analysis    (0.002 XLM)
- *   POST /api/code-explain      — Code explainer        (0.004 XLM)
- *   POST /api/agent/research    — Deep Research Agent   (0.01 XLM)
- *   POST /api/agent/code        — Coder Agent           (0.02 XLM)
- *   POST /api/agent/translate   — Translation Agent     (0.005 XLM)
+ *   POST /api/weather           — Weather lookup       (0.001 0G)
+ *   POST /api/summarize         — Text summarization   (0.003 0G)
+ *   POST /api/math-solve        — Math solver           (0.005 0G)
+ *   POST /api/sentiment         — Sentiment analysis    (0.002 0G)
+ *   POST /api/code-explain      — Code explainer        (0.004 0G)
+ *   POST /api/agent/research    — Deep Research Agent   (0.01 0G)
+ *   POST /api/agent/code        — Coder Agent           (0.02 0G)
+ *   POST /api/agent/translate   — Translation Agent     (0.005 0G)
  *
  * Endpoints (Free):
  *   GET  /health                — Server health
@@ -39,13 +39,16 @@ import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { Mppx, stellar, Store } from '@stellar/mpp/charge/server';
 import { Mppx as MppxChargeClient, stellar as stellarChargeClient } from '@stellar/mpp/charge/client';
-import { XLM_SAC_TESTNET, HORIZON_URLS } from '@stellar/mpp';
+import { XLM_SAC_TESTNET as TOKEN_SAC_TESTNET, HORIZON_URLS } from '@stellar/mpp';
 import { Keypair } from '@stellar/stellar-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
 import axios from 'axios';
 import { EXTERNAL_AGENTS, callExternalAgent } from './universal-adapter.js';
 import { fetchOnChainRegistry } from './evm/onChainRegistry.js';
+import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
+import { createWalletClient, http, isAddress, parseEther, type Address } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -60,15 +63,105 @@ const NETWORK_NAME = process.env.NETWORK_NAME || '0G-Galileo-Testnet';
 const CHAIN_ID = process.env.CHAIN_ID || '16602';
 const TOKEN_SYMBOL = process.env.TOKEN_SYMBOL || '0G';
 const BLOCK_EXPLORER_BASE = (process.env.BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').trim().replace(/\/$/, '');
+const EVM_RPC_URL = (process.env.EVM_RPC_URL || 'https://evmrpc-testnet.0g.ai').trim();
+const EVM_SETTLEMENT_ENABLED = process.env.EVM_SETTLEMENT_ENABLED === 'true';
+const EVM_SETTLEMENT_REQUIRED = process.env.EVM_SETTLEMENT_REQUIRED === 'true';
 /** Deployed `AgentRegistry` on 0G-Galileo-Testnet (EVM). */
 const AGENT_REGISTRY_CONTRACT_ADDRESS =
   (process.env.CONTRACT_ADDRESS || '').trim() || '0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D';
 const AGENT_REGISTRY_EXPLORER_URL = `${BLOCK_EXPLORER_BASE}/address/${AGENT_REGISTRY_CONTRACT_ADDRESS}`;
 const AGENT_PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY || process.env.MPP_SECRET_KEY;
+const MPP_SECRET_SEED = AGENT_PRIVATE_KEY?.trim() || '';
+let HAS_VALID_MPP_SECRET = false;
+
+if (MPP_SECRET_SEED) {
+  try {
+    Keypair.fromSecret(MPP_SECRET_SEED);
+    HAS_VALID_MPP_SECRET = true;
+  } catch {
+    HAS_VALID_MPP_SECRET = false;
+  }
+}
 
 /** When true, missing or invalid on-chain settlement throws (surfaces payment pipeline bugs). */
 function mppSettlementRequired(): boolean {
-  return Boolean(AGENT_PRIVATE_KEY) && process.env.SIMULATION_MODE !== 'true';
+  return HAS_VALID_MPP_SECRET && process.env.SIMULATION_MODE !== 'true';
+}
+
+function parseEvmPrivateKey(raw: string | undefined): `0x${string}` | null {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (!s) return null;
+  const h = s.startsWith('0x') ? s : `0x${s}`;
+  return /^0x[0-9a-fA-F]{64}$/.test(h) ? (h as `0x${string}`) : null;
+}
+
+const EVM_SETTLEMENT_PRIVATE_KEY = parseEvmPrivateKey(
+  process.env.EVM_SETTLEMENT_PRIVATE_KEY || process.env.AGENT_EVM_PRIVATE_KEY || process.env.AGENT_PRIVATE_KEY,
+);
+const EVM_SETTLEMENT_RECIPIENT = (process.env.EVM_SETTLEMENT_RECIPIENT || '').trim();
+const HAS_VALID_EVM_SETTLEMENT_RECIPIENT = Boolean(EVM_SETTLEMENT_RECIPIENT && isAddress(EVM_SETTLEMENT_RECIPIENT));
+
+let evmSettlementWarned = false;
+
+async function settleOn0GTestnet(amount0G: number): Promise<{ transaction: string; explorerUrl: string } | null> {
+  if (!EVM_SETTLEMENT_ENABLED) return null;
+  if (!EVM_SETTLEMENT_PRIVATE_KEY || !HAS_VALID_EVM_SETTLEMENT_RECIPIENT) {
+    if (EVM_SETTLEMENT_REQUIRED) {
+      throw new Error(
+        'EVM settlement is required but config is incomplete. Set EVM_SETTLEMENT_PRIVATE_KEY and EVM_SETTLEMENT_RECIPIENT.',
+      );
+    }
+    if (!evmSettlementWarned) {
+      console.warn(
+        '[WARN] EVM_SETTLEMENT_ENABLED=true but EVM settlement config is incomplete. Set EVM_SETTLEMENT_PRIVATE_KEY and EVM_SETTLEMENT_RECIPIENT (0x...). Falling back to simulated A2A payment ids.',
+      );
+      evmSettlementWarned = true;
+    }
+    return null;
+  }
+  const account = privateKeyToAccount(EVM_SETTLEMENT_PRIVATE_KEY);
+  const client = createWalletClient({
+    account,
+    chain: ogGalileoTestnet,
+    transport: http(EVM_RPC_URL),
+  });
+  const hash = await client.sendTransaction({
+    account,
+    to: EVM_SETTLEMENT_RECIPIENT as Address,
+    value: parseEther(amount0G.toString()),
+    chain: ogGalileoTestnet,
+  });
+  return {
+    transaction: hash,
+    explorerUrl: `${BLOCK_EXPLORER_BASE}/tx/${hash}`,
+  };
+}
+
+async function createA2APaymentLog(opts: {
+  endpoint: string;
+  payer: string;
+  worker: string;
+  token: string;
+  amount0G: number;
+  parentJobId: string;
+  depth: number;
+}): Promise<PaymentLog> {
+  const settled = await settleOn0GTestnet(opts.amount0G);
+  return {
+    id: `pay_sub_${(++paymentIdCounter).toString(36)}`,
+    timestamp: new Date().toISOString(),
+    endpoint: opts.endpoint,
+    payer: opts.payer,
+    worker: opts.worker,
+    transaction: settled?.transaction || `a2a_${Math.random().toString(16).slice(2, 14)}`,
+    token: opts.token,
+    amount: `${opts.amount0G} 0G`,
+    ...(settled?.explorerUrl ? { explorerUrl: settled.explorerUrl } : {}),
+    isA2A: true,
+    parentJobId: opts.parentJobId,
+    depth: opts.depth,
+  };
 }
 
 /** Stellar account public key (G + 55 base32 chars). */
@@ -77,7 +170,13 @@ function isStellarAccountId(value: string): boolean {
 }
 
 function resolveChargeRecipientPublicKey(): string {
-  const fromEnv = (process.env.SERVER_ADDRESS || process.env.STELLAR_RECIPIENT || '').trim();
+  const fromEnv = (
+    process.env.CHARGE_RECIPIENT ||
+    process.env.MPP_RECIPIENT ||
+    process.env.SERVER_ADDRESS ||
+    process.env.STELLAR_RECIPIENT ||
+    ''
+  ).trim();
   if (isStellarAccountId(fromEnv)) return fromEnv;
   if (AGENT_PRIVATE_KEY) {
     try {
@@ -99,7 +198,7 @@ function isStellarTransactionHash(value: unknown): value is string {
 }
 
 /** Deep link to a transaction on the configured explorer. */
-function stellarExpertTxUrl(txnHash: string): string | undefined {
+function ChainScanTxUrl(txnHash: string): string | undefined {
   if (!isStellarTransactionHash(txnHash)) return undefined;
   const h = txnHash.trim().toLowerCase();
   return `${BLOCK_EXPLORER_BASE}/tx/${h}`;
@@ -133,7 +232,7 @@ type ExplorerLinkResult = {
 };
 
 /**
- * Only attach StellarExpert / Horizon links if the tx exists on the configured Horizon
+ * Only attach ChainScan / Horizon links if the tx exists on the configured Horizon
  * (avoids "Transaction not found" when STELLAR_NETWORK/HORIZON_URL mismatch or receipt is wrong).
  * Set SKIP_HORIZON_TX_VERIFY=true to skip the HTTP check (dev only).
  */
@@ -147,7 +246,7 @@ async function finalizeExplorerLinksForTxHash(hash: string): Promise<ExplorerLin
   if (process.env.SKIP_HORIZON_TX_VERIFY === 'true') {
     return {
       settlementNetwork,
-      explorerUrl: stellarExpertTxUrl(h) || undefined,
+      explorerUrl: ChainScanTxUrl(h) || undefined,
       horizonUrl,
     };
   }
@@ -161,7 +260,7 @@ async function finalizeExplorerLinksForTxHash(hash: string): Promise<ExplorerLin
   }
   return {
     settlementNetwork,
-    explorerUrl: stellarExpertTxUrl(h) || undefined,
+    explorerUrl: ChainScanTxUrl(h) || undefined,
     horizonUrl,
   };
 }
@@ -175,7 +274,7 @@ const mppx = Mppx.create({
   methods: [
     stellar.charge({
       recipient: SERVER_ADDRESS,
-      currency: XLM_SAC_TESTNET,
+      currency: TOKEN_SAC_TESTNET,
       network: NETWORK,
       store: Store.memory(),
     }),
@@ -184,14 +283,20 @@ const mppx = Mppx.create({
 
 if (!AGENT_PRIVATE_KEY) {
   console.warn('[WARN] AGENT_PRIVATE_KEY (or MPP_SECRET_KEY) not set. Paid routes cannot verify MPP charges.');
+} else if (!HAS_VALID_MPP_SECRET) {
+  console.warn(
+    '[WARN] AGENT_PRIVATE_KEY / MPP_SECRET_KEY is not a valid Stellar secret seed (S...). Running without MPP settlement; set SIMULATION_MODE=true for mock settlement or provide a valid Stellar seed for MPP.',
+  );
 } else if (SERVER_ADDRESS && !isStellarAccountId(SERVER_ADDRESS)) {
-  console.warn('[WARN] SERVER_ADDRESS / STELLAR_RECIPIENT is not a valid Stellar public key; check your .env.');
+  console.warn(
+    '[WARN] CHARGE_RECIPIENT / MPP_RECIPIENT (or legacy SERVER_ADDRESS / STELLAR_RECIPIENT) is invalid. Expected a G-address for the current payment rail.',
+  );
 } else if (AGENT_PRIVATE_KEY && isStellarAccountId(SERVER_ADDRESS)) {
   try {
     const payerPk = Keypair.fromSecret(AGENT_PRIVATE_KEY).publicKey();
     if (payerPk === SERVER_ADDRESS) {
       console.warn(
-        '[WARN] MPP payer (AGENT_PRIVATE_KEY) and charge recipient (SERVER_ADDRESS/STELLAR_RECIPIENT) are the same G-address. On-chain XLM transfers to self barely change balance; set STELLAR_RECIPIENT to a separate treasury for clear settlement.',
+        '[WARN] MPP payer (AGENT_PRIVATE_KEY) and charge recipient (CHARGE_RECIPIENT/MPP_RECIPIENT; legacy SERVER_ADDRESS/STELLAR_RECIPIENT) are the same G-address. On-chain 0G transfers to self barely change balance; set a separate treasury address for clear settlement.',
       );
     }
   } catch {
@@ -215,12 +320,12 @@ function internalWorkerHttpBase(): string {
 
 let managerMppFetch: typeof globalThis.fetch | undefined;
 
-/** Fetch that completes Stellar MPP 402 → pay → retry (required for paid internal POSTs). */
+/** Fetch that completes 0G payment 402 → pay → retry (required for paid internal POSTs). */
 function getManagerMppFetch(): typeof globalThis.fetch {
-  if (!AGENT_PRIVATE_KEY) return globalThis.fetch;
+  if (!HAS_VALID_MPP_SECRET) return globalThis.fetch;
   if (!managerMppFetch) {
     const c = MppxChargeClient.create({
-      methods: [stellarChargeClient.charge({ secretKey: AGENT_PRIVATE_KEY })],
+      methods: [stellarChargeClient.charge({ secretKey: MPP_SECRET_SEED })],
       polyfill: false,
       fetch: globalThis.fetch,
     });
@@ -238,7 +343,7 @@ async function callInternalPaidWorker(
   const path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const url = `${base}${path}?token=${encodeURIComponent(token)}`;
   const useMpp =
-    AGENT_PRIVATE_KEY &&
+    HAS_VALID_MPP_SECRET &&
     process.env.SIMULATION_MODE !== 'true';
   const fetcher = useMpp ? getManagerMppFetch() : globalThis.fetch;
   const res = await fetcher(url, {
@@ -308,7 +413,7 @@ interface AgentRegistryEntry {
   address: string;
   endpoint: string;
   category: string;
-  priceXLM: number;
+  price0G: number;
   priceDrops: number;
   reputation: number;    // 0-100
   jobsCompleted: number;
@@ -319,8 +424,8 @@ interface AgentRegistryEntry {
 }
 
 interface PriceConfig {
-  xlmAmount: number;
-  xlmDrops: number;
+  tokenAmount: number;
+  tokenBaseUnits: number;
   description: string;
   category: string;
 }
@@ -362,8 +467,8 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5V3VF', // External placeholder
     endpoint: `/api/adapter/external/${ext.id}`,
     category: ext.category,
-    priceXLM: ext.price.amount,
-    priceDrops: Math.round(ext.price.amount * 10000000), // XLM to Drops (1 XLM = 10M drops)
+    price0G: ext.price.amount,
+    priceDrops: Math.round(ext.price.amount * 10000000), // 0G to Drops (1 0G = 10M drops)
     reputation: ext.reputation,
     jobsCompleted: 0,
     jobsFailed: 0,
@@ -379,7 +484,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5V3VF',
     endpoint: '/api/weather',
     category: 'data',
-    priceXLM: 0.001,
+    price0G: 0.001,
     priceDrops: 10000,
     reputation: 92,
     jobsCompleted: 847,
@@ -395,7 +500,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBY5V3VF',
     endpoint: '/api/summarize',
     category: 'nlp',
-    priceXLM: 0.003,
+    price0G: 0.003,
     priceDrops: 300,
     reputation: 88,
     jobsCompleted: 523,
@@ -411,7 +516,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCY5V3VF',
     endpoint: '/api/math-solve',
     category: 'compute',
-    priceXLM: 0.005,
+    price0G: 0.005,
     priceDrops: 500,
     reputation: 95,
     jobsCompleted: 1203,
@@ -427,7 +532,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDY5V3VF',
     endpoint: '/api/sentiment',
     category: 'nlp',
-    priceXLM: 0.002,
+    price0G: 0.002,
     priceDrops: 200,
     reputation: 79,
     jobsCompleted: 312,
@@ -443,7 +548,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEY5V3VF',
     endpoint: '/api/code-explain',
     category: 'code',
-    priceXLM: 0.006,
+    price0G: 0.006,
     priceDrops: 600,
     reputation: 91,
     jobsCompleted: 88,
@@ -459,7 +564,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5V3VF',
     endpoint: '/api/agent/research',
     category: 'research',
-    priceXLM: 0.015,
+    price0G: 0.015,
     priceDrops: 1500,
     reputation: 94,
     jobsCompleted: 215,
@@ -475,7 +580,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGY5V3VF',
     endpoint: '/api/agent/code',
     category: 'code',
-    priceXLM: 0.02,
+    price0G: 0.02,
     priceDrops: 2000,
     reputation: 94,
     jobsCompleted: 104,
@@ -491,7 +596,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHY5V3VF',
     endpoint: '/api/agent/translate',
     category: 'nlp',
-    priceXLM: 0.005,
+    price0G: 0.005,
     priceDrops: 500,
     reputation: 82,
     jobsCompleted: 145,
@@ -507,7 +612,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: 'GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDY5V3VF',
     endpoint: '/api/adapter/external/kaggleingest-agent',
     category: 'data',
-    priceXLM: 0.02,
+    price0G: 0.02,
     priceDrops: 2000,
     reputation: 95,
     jobsCompleted: 0,
@@ -524,7 +629,7 @@ const agentRegistry: AgentRegistryEntry[] = [
     address: SERVER_ADDRESS,
     endpoint: '/api/agent/arbitrate',
     category: 'Arbitrator',
-    priceXLM: 0.05,
+    price0G: 0.05,
     priceDrops: 5000,
     reputation: 99,
     jobsCompleted: 42,
@@ -554,8 +659,8 @@ function findAgentById(idOrName: string): AgentRegistryEntry | undefined {
 agentRegistry.forEach(a => {
   // Formula: (Reputation / 100) * (1 / (Price + 0.001))
   // We add 0.001 to avoid division by zero and give a slight floor to price impact.
-  a.efficiency = a.priceXLM > 0
-    ? Math.round((a.reputation / 100) * (1 / (a.priceXLM + 0.001)) * 100) / 100
+  a.efficiency = a.price0G > 0
+    ? Math.round((a.reputation / 100) * (1 / (a.price0G + 0.001)) * 100) / 100
     : 0;
 });
 
@@ -606,7 +711,7 @@ async function logPayment(
   const txId = raw || `sim_${(++paymentIdCounter).toString(16).padStart(8, '0')}`;
   const linkMeta = raw && isStellarTransactionHash(raw) ? await finalizeExplorerLinksForTxHash(raw) : { settlementNetwork: (NETWORK === 'stellar:pubnet' ? 'public' : 'testnet') as 'testnet' | 'public' };
 
-  const displayAmount = `${priceConfig.xlmAmount} XLM`;
+  const displayAmount = `${priceConfig.tokenAmount} 0G`;
 
   // Capture raw 402 headers for protocol transparency
   const rawHeaders: Record<string, string> = {};
@@ -647,10 +752,10 @@ async function logPayment(
 // Token Resolution + Payment Middleware Factory
 // ═══════════════════════════════════════════════════════════════════════════
 
-type TokenType = 'XLM';
+type TokenType = '0G';
 
 function resolveToken(req: Request): TokenType {
-  return 'XLM';
+  return '0G';
 }
 
 /**
@@ -725,11 +830,11 @@ function extractA2aPaymentFromWorkerResponse(
   if (pr) {
     const hash = parseTxHashFromPaymentReceiptHeader(pr);
     if (hash && isStellarTransactionHash(hash)) {
-      const ex = stellarExpertTxUrl(hash);
+      const ex = ChainScanTxUrl(hash);
       return {
         transaction: hash,
         token,
-        amount: `${price.xlmAmount} XLM`,
+        amount: `${price.tokenAmount} 0G`,
         ...(ex ? { explorerUrl: ex } : {}),
       };
     }
@@ -753,12 +858,12 @@ function extractA2aPaymentFromWorkerResponse(
       typeof pay.explorerUrl === 'string'
         ? pay.explorerUrl
         : isStellarTransactionHash(tx)
-          ? stellarExpertTxUrl(tx)
+          ? ChainScanTxUrl(tx)
           : undefined;
     return {
       transaction: tx,
       token: typeof pay.token === 'string' ? pay.token : token,
-      amount: typeof pay.amount === 'string' ? pay.amount : `${price.xlmAmount} XLM`,
+      amount: typeof pay.amount === 'string' ? pay.amount : `${price.tokenAmount} 0G`,
       ...(ex ? { explorerUrl: ex } : {}),
     };
   }
@@ -774,11 +879,11 @@ function extractA2aPaymentFromWorkerResponse(
         `[MPP A2A extractA2aPayment] payment-response / x-payment-response is not a 64-hex Stellar tx (got: ${JSON.stringify(tx)}).`,
       );
     }
-    const ex = isStellarTransactionHash(tx) ? stellarExpertTxUrl(tx) : undefined;
+    const ex = isStellarTransactionHash(tx) ? ChainScanTxUrl(tx) : undefined;
     return {
       transaction: tx,
       token,
-      amount: `${price.xlmAmount} XLM`,
+      amount: `${price.tokenAmount} 0G`,
       ...(ex ? { explorerUrl: ex } : {}),
     };
   }
@@ -790,7 +895,7 @@ function extractA2aPaymentFromWorkerResponse(
   return {
     transaction: `pay_${Math.random().toString(16).slice(2, 10)}`,
     token,
-    amount: `${price.xlmAmount} XLM`,
+    amount: `${price.tokenAmount} 0G`,
   };
 }
 
@@ -941,7 +1046,7 @@ function createPaidRoute(config: PriceConfig) {
 
     try {
       const chargeHandler = mppx.charge({
-        amount: config.xlmAmount.toString(),
+        amount: config.tokenAmount.toString(),
         description: config.description,
       });
 
@@ -973,62 +1078,62 @@ function createPaidRoute(config: PriceConfig) {
 
 const PRICES: Record<string, PriceConfig> = {
   weather: {
-    xlmAmount: 0.001,
-    xlmDrops: 100,
+    tokenAmount: 0.001,
+    tokenBaseUnits: 100,
     description: 'Weather data lookup (Worker Agent)',
     category: 'data',
   },
   summarize: {
-    xlmAmount: 0.003,
-    xlmDrops: 300,
+    tokenAmount: 0.003,
+    tokenBaseUnits: 300,
     description: 'AI text summarization (Worker Agent)',
     category: 'nlp',
   },
   mathSolve: {
-    xlmAmount: 0.005,
-    xlmDrops: 500,
+    tokenAmount: 0.005,
+    tokenBaseUnits: 500,
     description: 'Math equation solver (Worker Agent)',
     category: 'compute',
   },
   sentiment: {
-    xlmAmount: 0.002,
-    xlmDrops: 200,
+    tokenAmount: 0.002,
+    tokenBaseUnits: 200,
     description: 'Sentiment analysis (Worker Agent)',
     category: 'nlp',
   },
   codeExplain: {
-    xlmAmount: 0.004,
-    xlmDrops: 400,
+    tokenAmount: 0.004,
+    tokenBaseUnits: 400,
     description: 'Code explainer (Worker Agent)',
     category: 'dev',
   },
   research: {
-    xlmAmount: 0.01,
-    xlmDrops: 1000,
+    tokenAmount: 0.01,
+    tokenBaseUnits: 1000,
     description: 'Deep Research Agent (can hire sub-agents)',
     category: 'research',
   },
   coding: {
-    xlmAmount: 0.02,
-    xlmDrops: 2000,
+    tokenAmount: 0.02,
+    tokenBaseUnits: 2000,
     description: 'Senior Coder Agent (can hire sub-agents)',
     category: 'dev',
   },
   translate: {
-    xlmAmount: 0.005,
-    xlmDrops: 500,
+    tokenAmount: 0.005,
+    tokenBaseUnits: 500,
     description: 'Translation Agent (Worker Agent)',
     category: 'nlp',
   },
   kaggleingest: {
-    xlmAmount: 0.02,
-    xlmDrops: 2000,
+    tokenAmount: 0.02,
+    tokenBaseUnits: 2000,
     description: 'KaggleIngest DataService — dataset discovery and quality analysis',
     category: 'data',
   },
   arbitrator: {
-    xlmAmount: 0.05,
-    xlmDrops: 5000,
+    tokenAmount: 0.05,
+    tokenBaseUnits: 5000,
     description: 'Arbitrator Agent (Final Judgement Agent)',
     category: 'arbitrator',
   },
@@ -1083,7 +1188,7 @@ app.get('/', (_req: Request, res: Response) => {
     agentRegistryContract: AGENT_REGISTRY_CONTRACT_ADDRESS,
     agentRegistryExplorer: AGENT_REGISTRY_EXPLORER_URL,
     protocol: 'x402 (HTTP 402 Payment Required)',
-    tokenSupport: ['XLM', '0G'],
+    tokenSupport: ['0G', '0G'],
     features: [
       'Agent-to-Agent (A2A) recursive hiring',
       'On-chain reputation system',
@@ -1117,7 +1222,7 @@ app.get('/api/tools', (_req: Request, res: Response) => {
       name: agent?.name || id,
       endpoint: endpointMap[id] || `/api/${id}`,
       method: 'POST',
-      price: { XLM: config.xlmAmount, xlmDrops: config.xlmDrops },
+      price: { '0G': config.tokenAmount, tokenBaseUnits: config.tokenBaseUnits },
       category: config.category,
       description: config.description,
       reputation: agent?.reputation || 50,
@@ -1134,7 +1239,7 @@ app.get('/api/tools', (_req: Request, res: Response) => {
     name: agent.name,
     endpoint: `/api/adapter/external/${agent.id}`,
     method: 'POST',
-    price: { XLM: agent.price.amount, xlmDrops: 0 },
+    price: { '0G': agent.price.amount, tokenBaseUnits: 0 },
     category: agent.capabilities[0],
     description: agent.description,
     reputation: agent.reputation,
@@ -1186,7 +1291,7 @@ app.get('/api/registry', async (req: Request, res: Response) => {
       agents.sort((a, b) => b.reputation - a.reputation);
       break;
     case 'price':
-      agents.sort((a, b) => a.priceXLM - b.priceXLM);
+      agents.sort((a, b) => a.price0G - b.price0G);
       break;
     case 'jobs':
       agents.sort((a, b) => b.jobsCompleted - a.jobsCompleted);
@@ -1598,39 +1703,35 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
   const subAgentResults: any[] = [];
 
   // Step 0: Premium Data Source — Research Agent hires KaggleIngest PRO if query is data-related
-  const isDataQuery = query.toLowerCase().includes('data') || query.toLowerCase().includes('kaggle') || query.toLowerCase().includes('XLM');
+  const isDataQuery = query.toLowerCase().includes('data') || query.toLowerCase().includes('kaggle') || query.toLowerCase().includes('0G');
   if (isDataQuery) {
     broadcastSSE('a2a-hire', {
       hirer: 'DeepResearch Alpha',
       worker: 'KaggleIngest PRO',
       cost: 0.02,
-      reason: 'Sourcing premium XLM historical datasets and ecosystem metadata',
+      reason: 'Sourcing premium 0G historical datasets and ecosystem metadata',
       parentJobId: jobId,
       depth: 1,
       timestamp: new Date().toISOString(),
     });
 
-    const kagglePayment: PaymentLog = {
-      id: `pay_sub_${(++paymentIdCounter).toString(36)}`,
-      timestamp: new Date().toISOString(),
+    const kagglePayment = await createA2APaymentLog({
       endpoint: '/api/adapter/external/kaggleingest-agent',
       payer: 'DeepResearch Alpha',
       worker: 'KaggleIngest PRO',
-      transaction: `a2a_${Math.random().toString(16).slice(2, 14)}`,
-      token: token,
-      amount: '0.02 XLM',
-      isA2A: true,
+      token,
+      amount0G: 0.02,
       parentJobId: jobId,
       depth: 1,
-    };
+    });
     paymentLogs.push(kagglePayment);
     broadcastSSE('payment', kagglePayment);
 
     subAgentResults.push({
       agent: 'KaggleIngest PRO',
       task: 'Ingest premium ecosystem data',
-      cost: '0.02 XLM',
-      result: 'XLM Mainnet Launch metrics: 1.2M transactions, 45 active nodes, 98.4% uptime. TOON v2 schema detected.',
+      cost: '0.02 0G',
+      result: '0G Mainnet Launch metrics: 1.2M transactions, 45 active nodes, 98.4% uptime. TOON v2 schema detected.',
       payment: kagglePayment,
     });
   }
@@ -1642,7 +1743,7 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
       const completion = await groq.chat.completions.create({
         messages: [
           { role: 'system', content: 'You are a deep research agent. Provide comprehensive analysis with sources, key findings, and trends. Be thorough but concise.' },
-          { role: 'user', content: query + (isDataQuery ? " [Use KaggleIngest data: XLM counts, node activity]" : "") },
+          { role: 'user', content: query + (isDataQuery ? " [Use KaggleIngest data: 0G counts, node activity]" : "") },
         ],
         model: 'llama-3.3-70b-versatile',
         temperature: 0.5,
@@ -1675,7 +1776,7 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
   broadcastSSE('a2a-hire', {
     hirer: 'DeepResearch Alpha',
     worker: 'Summarizer Pro',
-    cost: PRICES.summarize.xlmAmount,
+    cost: PRICES.summarize.tokenAmount,
     reason: 'Condensing research findings into executive summary',
     parentJobId: jobId,
     depth: 1,
@@ -1683,26 +1784,22 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
   });
 
   // Simulate the sub-agent payment (in production, this goes through x402)
-  const subPayment1: PaymentLog = {
-    id: `pay_sub_${(++paymentIdCounter).toString(36)}`,
-    timestamp: new Date().toISOString(),
+  const subPayment1 = await createA2APaymentLog({
     endpoint: '/api/summarize',
     payer: 'DeepResearch Alpha',
     worker: 'Summarizer Pro',
-    transaction: `a2a_${Math.random().toString(16).slice(2, 14)}`,
-    token: token,
-    amount: `${PRICES.summarize.xlmAmount} XLM`,
-    isA2A: true,
+    token,
+    amount0G: PRICES.summarize.tokenAmount,
     parentJobId: jobId,
     depth: 1,
-  };
+  });
   paymentLogs.push(subPayment1);
   broadcastSSE('payment', subPayment1);
 
   subAgentResults.push({
     agent: 'Summarizer Pro',
     task: 'Condense research findings',
-    cost: `${PRICES.summarize.xlmAmount} XLM`,
+    cost: `${PRICES.summarize.tokenAmount} 0G`,
     result: typeof researchResult.summary === 'string'
       ? researchResult.summary.slice(0, 200) + '...'
       : 'Summary generated.',
@@ -1713,33 +1810,29 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
   broadcastSSE('a2a-hire', {
     hirer: 'DeepResearch Alpha',
     worker: 'SentimentAI',
-    cost: PRICES.sentiment.xlmAmount,
+    cost: PRICES.sentiment.tokenAmount,
     reason: 'Analyzing sentiment of research sources',
     parentJobId: jobId,
     depth: 1,
     timestamp: new Date().toISOString(),
   });
 
-  const subPayment2: PaymentLog = {
-    id: `pay_sub_${(++paymentIdCounter).toString(36)}`,
-    timestamp: new Date().toISOString(),
+  const subPayment2 = await createA2APaymentLog({
     endpoint: '/api/sentiment',
     payer: 'DeepResearch Alpha',
     worker: 'SentimentAI',
-    transaction: `a2a_${Math.random().toString(16).slice(2, 14)}`,
-    token: token,
-    amount: `${PRICES.sentiment.xlmAmount} XLM`,
-    isA2A: true,
+    token,
+    amount0G: PRICES.sentiment.tokenAmount,
     parentJobId: jobId,
     depth: 1,
-  };
+  });
   paymentLogs.push(subPayment2);
   broadcastSSE('payment', subPayment2);
 
   subAgentResults.push({
     agent: 'SentimentAI',
     task: 'Sentiment analysis of sources',
-    cost: `${PRICES.sentiment.xlmAmount} XLM`,
+    cost: `${PRICES.sentiment.tokenAmount} 0G`,
     result: 'Positive sentiment detected (confidence: 82%)',
     payment: subPayment2,
   });
@@ -1748,7 +1841,7 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
   const researchAgent = agentRegistry.find(a => a.id === 'research-agent');
   if (researchAgent) {
     researchAgent.jobsCompleted++;
-    researchAgent.totalEarned += PRICES.research.xlmAmount;
+    researchAgent.totalEarned += PRICES.research.tokenAmount;
     researchAgent.reputation = Math.min(100, researchAgent.reputation + 0.1);
   }
 
@@ -1756,7 +1849,7 @@ app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Re
     result: researchResult,
     subAgentHires: subAgentResults,
     recursiveDepth: 1,
-    totalCostIncludingSubAgents: PRICES.research.xlmAmount + PRICES.summarize.xlmAmount + PRICES.sentiment.xlmAmount + (isDataQuery ? 0.02 : 0),
+    totalCostIncludingSubAgents: PRICES.research.tokenAmount + PRICES.summarize.tokenAmount + PRICES.sentiment.tokenAmount + (isDataQuery ? 0.02 : 0),
     source: 'DeepResearch Alpha (A2A-enabled)',
     agentId: 'research-agent',
     a2aChain: [
@@ -1811,26 +1904,22 @@ app.post('/api/agent/code', createPaidRoute(PRICES.coding), async (req: Request,
   broadcastSSE('a2a-hire', {
     hirer: 'SeniorCoder GPT',
     worker: 'CodeExplainer',
-    cost: PRICES.codeExplain.xlmAmount,
+    cost: PRICES.codeExplain.tokenAmount,
     reason: 'Self-review: verifying generated code quality',
     parentJobId: jobId,
     depth: 1,
     timestamp: new Date().toISOString(),
   });
 
-  const subPayment: PaymentLog = {
-    id: `pay_sub_${(++paymentIdCounter).toString(36)}`,
-    timestamp: new Date().toISOString(),
+  const subPayment = await createA2APaymentLog({
     endpoint: '/api/code-explain',
     payer: 'SeniorCoder GPT',
     worker: 'CodeExplainer',
-    transaction: `a2a_${Math.random().toString(16).slice(2, 14)}`,
-    token: token,
-    amount: `${PRICES.codeExplain.xlmAmount} XLM`,
-    isA2A: true,
+    token,
+    amount0G: PRICES.codeExplain.tokenAmount,
     parentJobId: jobId,
     depth: 1,
-  };
+  });
   paymentLogs.push(subPayment);
   broadcastSSE('payment', subPayment);
 
@@ -1838,7 +1927,7 @@ app.post('/api/agent/code', createPaidRoute(PRICES.coding), async (req: Request,
   const codingAgent = agentRegistry.find(a => a.id === 'coding-agent');
   if (codingAgent) {
     codingAgent.jobsCompleted++;
-    codingAgent.totalEarned += PRICES.coding.xlmAmount;
+    codingAgent.totalEarned += PRICES.coding.tokenAmount;
     codingAgent.reputation = Math.min(100, codingAgent.reputation + 0.1);
   }
 
@@ -1848,10 +1937,10 @@ app.post('/api/agent/code', createPaidRoute(PRICES.coding), async (req: Request,
     selfReview: {
       agent: 'CodeExplainer',
       verdict: 'Code passes quality checks. Clean structure, proper error handling.',
-      cost: `${PRICES.codeExplain.xlmAmount} XLM`,
+      cost: `${PRICES.codeExplain.tokenAmount} 0G`,
       payment: subPayment,
     },
-    totalCostIncludingSubAgents: PRICES.coding.xlmAmount + PRICES.codeExplain.xlmAmount,
+    totalCostIncludingSubAgents: PRICES.coding.tokenAmount + PRICES.codeExplain.tokenAmount,
     source: 'SeniorCoder GPT (A2A-enabled)',
     agentId: 'coding-agent',
     a2aChain: [
@@ -1871,8 +1960,8 @@ async function adapterExternalPaidGate(req: Request, res: Response, next: NextFu
     return;
   }
   const priceConfig: PriceConfig = {
-    xlmAmount: agent.price.amount,
-    xlmDrops: Math.round(agent.price.amount * 10_000_000),
+    tokenAmount: agent.price.amount,
+    tokenBaseUnits: Math.round(agent.price.amount * 10_000_000),
     description: `External adapter: ${agent.name}`,
     category: agent.category,
   };
@@ -1938,7 +2027,7 @@ interface AgentExecutionResult {
     error?: string;
   }>;
   finalAnswer: string;
-  totalCost: { XLM: number; xlmDrops: number };
+  totalCost: { tokenAmount: number; tokenBaseUnits: number };
   a2aDepth: number;
   protocolTrace: Array<{
     step: string;
@@ -1974,7 +2063,7 @@ function autonomousHiringDecision(
     return { chosen: null, reason: 'No agents available in this category', alternatives: [] };
   }
 
-  // Sort by efficiency score: (reputation / 100) * (1 / (priceXLM + 0.001)) — favors high-rep, low-cost
+  // Sort by efficiency score: (reputation / 100) * (1 / (price0G + 0.001)) — favors high-rep, low-cost
   const scored = candidates.map(a => ({
     agent: a,
     score: a.efficiency, // Use pre-calculated efficiency
@@ -1983,9 +2072,9 @@ function autonomousHiringDecision(
   const chosen = scored[0].agent;
   const alternatives = scored.slice(1).map(s => s.agent);
 
-  const reason = `Selected ${chosen.name} (Rep: ${chosen.reputation}/100, Cost: ${chosen.priceXLM} XLM, Efficiency: ${scored[0].score.toFixed(1)}). ` +
+  const reason = `Selected ${chosen.name} (Rep: ${chosen.reputation}/100, Cost: ${chosen.price0G} 0G, Efficiency: ${scored[0].score.toFixed(1)}). ` +
     (alternatives.length > 0
-      ? `Rejected ${alternatives[0].name} (Rep: ${alternatives[0].reputation}, Cost: ${alternatives[0].priceXLM} XLM) — lower efficiency score.`
+      ? `Rejected ${alternatives[0].name} (Rep: ${alternatives[0].reputation}, Cost: ${alternatives[0].price0G} 0G) — lower efficiency score.`
       : 'No alternatives available.');
 
   return { chosen, reason, alternatives };
@@ -1994,9 +2083,12 @@ function autonomousHiringDecision(
 /** Rich error text when a manager hire fails (used instead of silent sim_fallback when real settlement is required). */
 function formatManagerToolFailure(err: unknown, endpoint: string, toolId: string): string {
   const e = err as { message?: string; response?: { status?: number; data?: unknown; headers?: unknown }; stack?: string };
+  const settlementPolicy = HAS_VALID_MPP_SECRET
+    ? 'Refusing simulation fallback while valid MPP secrets are configured (set SIMULATION_MODE=true to allow mock settlement).'
+    : 'Simulation fallback is disabled because no valid MPP Stellar seed is configured for this process.';
   const lines = [
     `[MPP A2A] Manager hire failed for toolId="${toolId}" endpoint="${endpoint}".`,
-    `Refusing simulation fallback while MPP secrets are configured (set SIMULATION_MODE=true to allow mock settlement).`,
+    settlementPolicy,
     `cause.message=${e?.message || String(err)}`,
   ];
   if (e?.response?.status !== undefined) lines.push(`cause.response.status=${e.response.status}`);
@@ -2009,7 +2101,7 @@ function formatManagerToolFailure(err: unknown, endpoint: string, toolId: string
   }
   if (endpoint.includes('/api/adapter/external/')) {
     lines.push(
-      'Hint: this path must be behind the same Stellar MPP charge gate as other paid routes (Payment-Receipt on 200).',
+      'Hint: this path must be behind the same 0G payment charge gate as other paid routes (Payment-Receipt on 200).',
     );
   }
   if (e?.stack) lines.push(`cause.stack:\n${e.stack}`);
@@ -2084,7 +2176,7 @@ async function runManagerAgent(
   const hiringDecisions: AgentExecutionResult['hiringDecisions'] = [];
   const protocolTrace: AgentExecutionResult['protocolTrace'] = [];
   const results: AgentExecutionResult['results'] = [];
-  const totalCost = { XLM: 0, xlmDrops: 0 };
+  const totalCost = { tokenAmount: 0, tokenBaseUnits: 0 };
   let a2aDepth = 0;
 
   // ── Step 1: Analyze Intent ──
@@ -2105,10 +2197,10 @@ async function runManagerAgent(
   // ── Step 2: LLM Planning ──
   // ── Step 2: LLM Planning ──
   const toolsList = agentRegistry.map(agent => {
-    return `- "${agent.id}": ${agent.category} Agent | Cost: ${agent.priceXLM} XLM | Reputation: ${agent.reputation}/100`;
+    return `- "${agent.id}": ${agent.category} Agent | Cost: ${agent.price0G} 0G | Reputation: ${agent.reputation}/100`;
   }).join('\n');
 
-  const plannerPrompt = `You are the MANAGER AGENT of mogause — an autonomous AI economy on Stellar blockchain.
+  const plannerPrompt = `You are the MANAGER AGENT of mogause — an autonomous AI economy on 0G blockchain.
 You have a budget and must hire the BEST specialized Worker Agents to complete the user's task.
 
 Available Worker Agents (x402 paid APIs):
@@ -2192,8 +2284,8 @@ Return ONLY valid JSON:
       const extAgent = findAgentById(toolId);
       if (extAgent) {
         price = {
-          xlmAmount: getDiscountedPrice(extAgent.priceXLM, userReputation),
-          xlmDrops: extAgent.priceDrops,
+          tokenAmount: getDiscountedPrice(extAgent.price0G, userReputation),
+          tokenBaseUnits: extAgent.priceDrops,
           description: `External Agent: ${extAgent.name} (Discount applied: ${userReputation>=REPUTATION_TIERS.SILVER ? 'YES':'NO'})`,
           category: extAgent.category
         };
@@ -2205,14 +2297,14 @@ Return ONLY valid JSON:
       continue;
     }
 
-    if (totalCost.XLM + price.xlmAmount > budgetLimit) {
-      console.warn(`[BUDGET GUARD] Transaction blocked. Cost ${price.xlmAmount} exceed remaining budget of ${budgetLimit - totalCost.XLM} XLM`);
+    if (totalCost.tokenAmount + price.tokenAmount > budgetLimit) {
+      console.warn(`[BUDGET GUARD] Transaction blocked. Cost ${price.tokenAmount} exceed remaining budget of ${budgetLimit - totalCost.tokenAmount} 0G`);
       results.push({
         tool: toolId,
         result: null,
-        error: `Budget limit reached (${budgetLimit} XLM). Arbitrator Agent could be hired to request a budget increase.`
+        error: `Budget limit reached (${budgetLimit} 0G). Arbitrator Agent could be hired to request a budget increase.`
       });
-      plan.push(`[GUARD] Blocked ${toolId}: Budget Limit (${budgetLimit} XLM) exceeded.`);
+      plan.push(`[GUARD] Blocked ${toolId}: Budget Limit (${budgetLimit} 0G) exceeded.`);
       continue;
     }
 
@@ -2223,11 +2315,11 @@ Return ONLY valid JSON:
     hiringDecisions.push({
       agent: agentName,
       reason: hiring.reason,
-      cost: price.xlmAmount,
+      cost: price.tokenAmount,
       reputation: hiring.chosen?.reputation || 0,
       alternative: hiring.alternatives[0]?.name,
       alternativeReason: hiring.alternatives[0]
-        ? `${hiring.alternatives[0].reputation}/100 rep, ${hiring.alternatives[0].priceXLM} XLM`
+        ? `${hiring.alternatives[0].reputation}/100 rep, ${hiring.alternatives[0].price0G} 0G`
         : undefined,
     });
 
@@ -2249,13 +2341,13 @@ Return ONLY valid JSON:
     if (clientId) {
       sendSSETo(clientId, 'step', {
         label: `Hiring ${agentName}`,
-        detail: `${price.xlmAmount} XLM | Rep: ${hiring.chosen?.reputation || 'N/A'}/100`,
+        detail: `${price.tokenAmount} 0G | Rep: ${hiring.chosen?.reputation || 'N/A'}/100`,
         status: 'active',
       });
     }
 
-    totalCost.XLM += price.xlmAmount;
-    totalCost.xlmDrops += price.xlmDrops;
+    totalCost.tokenAmount += price.tokenAmount;
+    totalCost.tokenBaseUnits += price.tokenBaseUnits;
 
     // ── Execute the tool call (with x402 payment) ──
     let payment: any;
@@ -2325,7 +2417,7 @@ Return ONLY valid JSON:
         // Track sub-agent hires from recursive agents
         if ((data as any).subAgentHires) {
           a2aDepth = Math.max(a2aDepth, (data as any).recursiveDepth || 1);
-          totalCost.XLM += ((data as any).totalCostIncludingSubAgents || 0) - price.xlmAmount;
+          totalCost.tokenAmount += ((data as any).totalCostIncludingSubAgents || 0) - price.tokenAmount;
         }
 
         // Protocol trace
@@ -2385,7 +2477,7 @@ Return ONLY valid JSON:
             const fallbackName = fallbackAgent.name;
 
             console.log(`[SELF-HEAL] Attempt ${retry + 1}: Switching from ${agentName} to ${fallbackName}`);
-            plan.push(`[SELF-HEAL] ${agentName} failed. Retrying with ${fallbackName} (Rep: ${fallbackAgent.reputation}, Cost: ${fallbackAgent.priceXLM} XLM)`);
+            plan.push(`[SELF-HEAL] ${agentName} failed. Retrying with ${fallbackName} (Rep: ${fallbackAgent.reputation}, Cost: ${fallbackAgent.price0G} 0G)`);
 
             if (clientId) {
               sendSSETo(clientId, 'step', {
@@ -2413,8 +2505,8 @@ Return ONLY valid JSON:
               const fallbackData = fb.data as Record<string, unknown>;
               toolResult = fallbackData.result || fallbackData.weather || fallbackData.summary || fallbackData;
               const fallbackPrice: PriceConfig = {
-                xlmAmount: fallbackAgent.priceXLM,
-                xlmDrops: fallbackAgent.priceDrops,
+                tokenAmount: fallbackAgent.price0G,
+                tokenBaseUnits: fallbackAgent.priceDrops,
                 description: `Fallback: ${fallbackName}`,
                 category: 'a2a',
               };
@@ -2456,7 +2548,7 @@ Return ONLY valid JSON:
               paymentLogs.push(fallbackPaymentLog);
               broadcastSSE('payment', fallbackPaymentLog);
 
-              totalCost.XLM += fallbackAgent.priceXLM;
+              totalCost.tokenAmount += fallbackAgent.price0G;
 
               results.push({
                 tool: `${fallbackName} (healed from ${agentName})`,
@@ -2489,11 +2581,13 @@ Return ONLY valid JSON:
           // Fallback to simulation when all retries exhaust (only when not requiring on-chain settlement)
           console.warn(`[FALLBACK] Paid internal HTTP + self-healing failed for ${toolId}. Using simulation.`);
           const simResult = await simulateToolResult(toolId, tc.params, query);
+          const settled = await settleOn0GTestnet(price.tokenAmount);
           const simPayment = {
-            transaction: `sim_fallback_${toolId}_${Math.random().toString(16).slice(2, 10)}`,
-            token: token || 'XLM',
-            amount: `${price.xlmAmount} XLM`,
-            mode: 'simulation-fallback',
+            transaction: settled?.transaction || `sim_fallback_${toolId}_${Math.random().toString(16).slice(2, 10)}`,
+            token: token || '0G',
+            amount: `${price.tokenAmount} 0G`,
+            mode: settled ? 'evm-onchain-fallback' : 'simulation-fallback',
+            ...(settled?.explorerUrl ? { explorerUrl: settled.explorerUrl } : {}),
           };
 
           // **LOG SIMULATION FALLBACK PAYMENT**
@@ -2506,6 +2600,7 @@ Return ONLY valid JSON:
             transaction: simPayment.transaction,
             token: simPayment.token,
             amount: simPayment.amount,
+            ...(simPayment.explorerUrl ? { explorerUrl: simPayment.explorerUrl } : {}),
             isA2A: true,
             depth: 0,
           };
@@ -2532,7 +2627,7 @@ Return ONLY valid JSON:
     if (clientId) {
       sendSSETo(clientId, 'step', {
         label: `Hiring ${agentName}`,
-        detail: `Paid ${price.xlmAmount} XLM ✓`,
+        detail: `Paid ${price.tokenAmount} 0G ✓`,
         status: 'complete',
       });
     }
@@ -2541,7 +2636,7 @@ Return ONLY valid JSON:
     const registryAgent = agentRegistry.find(a => a.name === agentName || a.id === `${toolId}-agent`);
     if (registryAgent) {
       registryAgent.jobsCompleted++;
-      registryAgent.totalEarned += price.xlmAmount;
+      registryAgent.totalEarned += price.tokenAmount;
     }
   }
 
@@ -2592,7 +2687,7 @@ Return ONLY valid JSON:
     sendSSETo(clientId, 'done', { duration: Date.now() - startTime });
   }
 
-plan.push(`Total cost: ${totalCost.XLM.toFixed(4)} XLM`);
+plan.push(`Total cost: ${totalCost.tokenAmount.toFixed(4)} 0G`);
     plan.push(`A2A depth: ${a2aDepth}`);
     plan.push(`Duration: ${Date.now() - startTime}ms`);
 
@@ -2603,8 +2698,8 @@ plan.push(`Total cost: ${totalCost.XLM.toFixed(4)} XLM`);
     results,
     finalAnswer,
     totalCost: {
-      XLM: Math.round(totalCost.XLM * 10000) / 10000,
-      xlmDrops: totalCost.xlmDrops,
+      tokenAmount: Math.round(totalCost.tokenAmount * 10000) / 10000,
+      tokenBaseUnits: totalCost.tokenBaseUnits,
     },
     a2aDepth,
     protocolTrace,
@@ -2738,7 +2833,7 @@ function createL2Settlement(
     worker: worker,
     transaction: `a2a_${Math.random().toString(16).slice(2, 14)}`,
     token,
-    amount: `${price.xlmAmount} XLM`,
+    amount: `${price.tokenAmount} 0G`,
     isA2A: true,
     depth,
   };
@@ -2782,7 +2877,7 @@ app.post('/api/agent/query', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await runManagerAgent(query, token || 'XLM', clientId, options);
+    const result = await runManagerAgent(query, token || '0G', clientId, options);
     res.json(result);
   } catch (err) {
     console.error('[AGENT QUERY ERROR]', err);
@@ -2848,7 +2943,7 @@ app.post('/api/agent/brainstorm', async (req: Request, res: Response) => {
   try {
     const sessionResults: any[] = [];
     const plan: string[] = [`[BRAINSTORM] Topic: "${topic}"`];
-    let totalXLM = 0;
+    let total0G = 0;
 
     for (const idOrName of (agentIds || [])) {
       const agent = findAgentById(idOrName);
@@ -2865,9 +2960,9 @@ app.post('/api/agent/brainstorm', async (req: Request, res: Response) => {
       sessionResults.push({
         agent: agent.name,
         contribution: `[Expert Insight] Based on my ${agent.category} training, for "${topic}", we should focus on... ${agent.reputation > 90 ? 'Optimized execution patterns.' : 'Standard protocol compliance.'}`,
-        cost: agent.priceXLM,
+        cost: agent.price0G,
       });
-      totalXLM += agent.priceXLM;
+      total0G += agent.price0G;
     }
 
     if (clientId) {
@@ -2881,7 +2976,7 @@ app.post('/api/agent/brainstorm', async (req: Request, res: Response) => {
       topic,
       plan,
       results: sessionResults,
-      totalCost: totalXLM,
+      totalCost: total0G,
       message: 'Collaboration successful.'
     });
   } catch (err: any) {
@@ -2910,14 +3005,14 @@ app.post('/api/kaggleingest', async (req: Request, res: Response) => {
       payer: 'API Caller',
       worker: 'KaggleIngest DataService',
       transaction: `ki_${Math.random().toString(16).slice(2, 14)}`,
-      token: 'XLM',
-      amount: '0.02 XLM',
+      token: '0G',
+      amount: '0.02 0G',
       isA2A: false,
       depth: 0,
     });
     broadcastSSE('payment', paymentLogs[paymentLogs.length - 1]);
 
-    res.set('x-402-cost', '0.02 XLM');
+    res.set('x-402-cost', '0.02 0G');
     res.set('x-agent-protocol', 'MCP-Connect');
     res.json({
       status: 'success',
@@ -2963,8 +3058,8 @@ app.post('/api/agent/stress-test', async (req: Request, res: Response) => {
         metadata = {
           flashSwap: {
             provider: 'Bitflow',
-            pair: 'XLM/XLM',
-            amount: '0.005 XLM',
+            pair: '0G/0G',
+            amount: '0.005 0G',
             fee: '100 stroops',
             reason: 'Liquidity balance for sub-agent hire'
           }
@@ -2978,8 +3073,8 @@ app.post('/api/agent/stress-test', async (req: Request, res: Response) => {
         payer: i === 0 ? 'Manager' : activeAgents[i-1].name,
         worker: agent.name,
         transaction: `tx_stress_${Math.random().toString(16).slice(2, 10)}`,
-        token: 'XLM',
-        amount: swapNeeded ? '0.005 XLM' : `${agent.priceXLM} XLM`,
+        token: '0G',
+        amount: swapNeeded ? '0.005 0G' : `${agent.price0G} 0G`,
         isA2A: true,
         depth: depth,
         metadata
@@ -3034,7 +3129,7 @@ app.listen(PORT, HOST, () => {
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log('║  Paid Endpoints (Worker Agents):');
   Object.entries(PRICES).forEach(([id, p]) => {
-    console.log(`║    ${id.padEnd(12)} ${p.xlmAmount.toString().padEnd(6)} XLM | ${p.xlmDrops.toString().padEnd(8)} drops`);
+    console.log(`║    ${id.padEnd(12)} ${p.tokenAmount.toString().padEnd(6)} 0G | ${p.tokenBaseUnits.toString().padEnd(8)} drops`);
   });
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log('║  Free Endpoints:');
@@ -3045,6 +3140,10 @@ app.listen(PORT, HOST, () => {
 });
 
 export default app;
+
+
+
+
 
 
 

@@ -23,7 +23,7 @@ export default function LicensePage() {
         <section>
           <h2>1. Open Source Foundation</h2>
           <p>
-            mogause is committed to the open-source ethos of the Stellar and blockchain communities.
+            mogause is committed to the open-source ethos of the 0G and broader blockchain communities.
             The core protocol and smart contracts are licensed under the <strong>MIT License</strong>.
           </p>
         </section>

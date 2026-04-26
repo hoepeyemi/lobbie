@@ -15,10 +15,10 @@ export const EXTERNAL_AGENTS: AgentCard[] = [
   {
     id: 'auditor-zero',
     name: 'Auditor Zero (Security)',
-    description: 'Top-tier smart contract auditor — finds vulnerabilities in Stellar (Soroban) and EVM contracts',
+    description: 'Top-tier smart contract auditor — finds vulnerabilities in 0G and EVM contracts',
     capabilities: ['smart-contract-audit', 'gas-optimization'],
     protocol: 'MCP-Connect',
-    price: { amount: 0.05, unit: 'XLM' },
+    price: { amount: 0.05, unit: '0G' },
     reputation: 98,
     category: 'audit'
   },
@@ -28,7 +28,7 @@ export const EXTERNAL_AGENTS: AgentCard[] = [
     description: 'Real-time crypto market data, price feeds, and DeFi analytics',
     capabilities: ['price-feed', 'defi-analytics', 'market-data'],
     protocol: 'x402-REST',
-    price: { amount: 0.01, unit: 'XLM' },
+    price: { amount: 0.01, unit: '0G' },
     reputation: 95,
     category: 'finance'
   },
@@ -38,7 +38,7 @@ export const EXTERNAL_AGENTS: AgentCard[] = [
     description: 'Smart contract legal compliance and regulatory analysis',
     capabilities: ['compliance-check', 'regulatory-analysis'],
     protocol: 'x402-REST',
-    price: { amount: 0.04, unit: 'XLM' },
+    price: { amount: 0.04, unit: '0G' },
     reputation: 90,
     category: 'legal'
   },
@@ -48,7 +48,7 @@ export const EXTERNAL_AGENTS: AgentCard[] = [
     description: 'Dataset discovery, summarization, and quality flagging via KaggleIngest MCP bridge. Provides structured dataset metadata, quality scores, and AI-generated summaries for informed data sourcing decisions.',
     capabilities: ['dataset-search', 'data-summary', 'quality-flag', 'machine-learning'],
     protocol: 'MCP-Connect',
-    price: { amount: 0.02, unit: 'XLM' },
+    price: { amount: 0.02, unit: '0G' },
     reputation: 92,
     category: 'data'
   },
@@ -58,7 +58,7 @@ export const EXTERNAL_AGENTS: AgentCard[] = [
     description: 'Fallback dataset provider. Slower and more expensive, but reliable.',
     capabilities: ['dataset-search', 'data-summary'],
     protocol: 'MCP-Connect',
-    price: { amount: 0.04, unit: 'XLM' }, // Higher price
+    price: { amount: 0.04, unit: '0G' }, // Higher price
     reputation: 85, // Lower reputation
     category: 'data'
   },

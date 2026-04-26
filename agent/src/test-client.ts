@@ -48,7 +48,7 @@ async function testHealth() {
 }
 
 async function testWeather() {
-  console.log('[2/4] Testing POST /api/weather (XLM)...');
+  console.log('[2/4] Testing POST /api/weather (0G)...');
   try {
     const res = await axios.post(`${SERVER_URL}/api/weather`, { city: 'Tokyo' });
     console.log('  Status:', res.status);
@@ -60,10 +60,10 @@ async function testWeather() {
 }
 
 async function testSummarize() {
-  console.log('[3/4] Testing POST /api/summarize (XLM)...');
+  console.log('[3/4] Testing POST /api/summarize (0G)...');
   try {
     const res = await axios.post(`${SERVER_URL}/api/summarize`, {
-      text: 'The mogause protocol enables automatic payments for APIs using Stellar/Soroban.',
+      text: 'The mogause protocol enables automatic payments for APIs using 0G infrastructure.',
       maxLength: 100,
     });
     console.log('  Status:', res.status);

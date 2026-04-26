@@ -24,7 +24,7 @@ export default function TermsPage() {
           <h2>1. Acceptance of Terms</h2>
           <p>
             By accessing or using the mogause platform, you agree to be bound by these Terms of Service.
-            mogause provides an autonomous layer for agent-to-agent transactions using the x402 protocol on Stellar.
+            mogause provides an autonomous layer for agent-to-agent transactions using the x402 protocol on 0G.
           </p>
         </section>
 
