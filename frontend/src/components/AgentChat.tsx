@@ -18,6 +18,11 @@ interface Message {
   subAgentHires?: any[];
 }
 
+const SWARM_PROVIDER = process.env.NEXT_PUBLIC_ZG_COMPUTE_PROVIDER_ADDRESS?.trim();
+const SWARM_MODEL = process.env.NEXT_PUBLIC_ZG_COMPUTE_MODEL?.trim();
+const SWARM_SERVICE_TYPE = process.env.NEXT_PUBLIC_ZG_COMPUTE_SERVICE_TYPE?.trim() || 'chatbot';
+const SWARM_ENABLED = process.env.NEXT_PUBLIC_USE_0G_SWARM === 'true';
+
 const SimpleMarkdown = ({ text }: { text: string }) => {
   // Check if text is JSON and format it nicely
   try {
@@ -304,7 +309,18 @@ export default function AgentChat({ onNewPayments, onProtocolTrace }: Params) {
       const response = await fetch(`${API_URL}/api/agent/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: userMsg, clientId: clientId.current })
+        body: JSON.stringify({
+          query: userMsg,
+          clientId: clientId.current,
+          options: SWARM_ENABLED
+            ? {
+                use0gCompute: true,
+                serviceType: SWARM_SERVICE_TYPE,
+                ...(SWARM_PROVIDER ? { providerAddress: SWARM_PROVIDER, strictProvider: true } : {}),
+                ...(SWARM_MODEL ? { model: SWARM_MODEL, strictModel: true } : {}),
+              }
+            : undefined,
+        })
       });
 
       const ct = response.headers.get('content-type') || '';

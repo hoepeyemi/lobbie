@@ -38,7 +38,6 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { Mppx, stellar, Store } from '@stellar/mpp/charge/server';
-import { Mppx as MppxChargeClient, stellar as stellarChargeClient } from '@stellar/mpp/charge/client';
 import { XLM_SAC_TESTNET as TOKEN_SAC_TESTNET, HORIZON_URLS } from '@stellar/mpp';
 import { Keypair } from '@stellar/stellar-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -49,6 +48,14 @@ import { fetchOnChainRegistry } from './evm/onChainRegistry.js';
 import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
 import { createWalletClient, http, isAddress, parseEther, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import {
+  depositToComputeLedger,
+  getComputeAccountSummary,
+  getSwarmSessions,
+  runSwarmQuery,
+  transferToInferenceProvider,
+} from './zgCompute/swarm.js';
+import type { SwarmSession } from './zgCompute/swarm.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -70,11 +77,14 @@ const EVM_SETTLEMENT_REQUIRED = process.env.EVM_SETTLEMENT_REQUIRED === 'true';
 const AGENT_REGISTRY_CONTRACT_ADDRESS =
   (process.env.CONTRACT_ADDRESS || '').trim() || '0xe27bCA717aA803dBc1AB3989a915507ddfbbFb4D';
 const AGENT_REGISTRY_EXPLORER_URL = `${BLOCK_EXPLORER_BASE}/address/${AGENT_REGISTRY_CONTRACT_ADDRESS}`;
+/** Legacy Stellar micropayment rail (`@stellar/mpp` / `mppx`). Default off — use 0G EVM settlement envs instead. */
+const USE_STELLAR_MPP = process.env.USE_STELLAR_MPP === 'true';
+
 const AGENT_PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY || process.env.MPP_SECRET_KEY;
 const MPP_SECRET_SEED = AGENT_PRIVATE_KEY?.trim() || '';
 let HAS_VALID_MPP_SECRET = false;
 
-if (MPP_SECRET_SEED) {
+if (USE_STELLAR_MPP && MPP_SECRET_SEED) {
   try {
     Keypair.fromSecret(MPP_SECRET_SEED);
     HAS_VALID_MPP_SECRET = true;
@@ -83,9 +93,16 @@ if (MPP_SECRET_SEED) {
   }
 }
 
-/** When true, missing or invalid on-chain settlement throws (surfaces payment pipeline bugs). */
-function mppSettlementRequired(): boolean {
-  return HAS_VALID_MPP_SECRET && process.env.SIMULATION_MODE !== 'true';
+/** When true, missing or invalid Stellar ledger settlement throws (MPP / mppx path only). */
+function stellarMppSettlementRequired(): boolean {
+  return USE_STELLAR_MPP && HAS_VALID_MPP_SECRET && process.env.SIMULATION_MODE !== 'true';
+}
+
+/** Simulation fallback after failed manager→worker HTTP is disallowed when strict rails are enabled. */
+function disallowSimulationFallback(): boolean {
+  if (process.env.SIMULATION_MODE === 'true') return false;
+  if (stellarMppSettlementRequired()) return true;
+  return process.env.EVM_SETTLEMENT_REQUIRED === 'true';
 }
 
 function parseEvmPrivateKey(raw: string | undefined): `0x${string}` | null {
@@ -101,6 +118,7 @@ const EVM_SETTLEMENT_PRIVATE_KEY = parseEvmPrivateKey(
 );
 const EVM_SETTLEMENT_RECIPIENT = (process.env.EVM_SETTLEMENT_RECIPIENT || '').trim();
 const HAS_VALID_EVM_SETTLEMENT_RECIPIENT = Boolean(EVM_SETTLEMENT_RECIPIENT && isAddress(EVM_SETTLEMENT_RECIPIENT));
+const ZG_SWARM_DEFAULT = process.env.ZG_SWARM_DEFAULT === 'true';
 
 let evmSettlementWarned = false;
 
@@ -197,10 +215,17 @@ function isStellarTransactionHash(value: unknown): value is string {
   return /^[0-9a-f]{64}$/.test(v);
 }
 
-/** Deep link to a transaction on the configured explorer. */
+/** 0G / EVM tx hash as returned by viem (`0x` + 64 hex). */
+function isEvmTxHash(value: unknown): value is string {
+  return typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value.trim());
+}
+
+/** Deep link to a transaction on the configured explorer (EVM or Stellar ledger hash). */
 function ChainScanTxUrl(txnHash: string): string | undefined {
-  if (!isStellarTransactionHash(txnHash)) return undefined;
-  const h = txnHash.trim().toLowerCase();
+  const t = txnHash.trim();
+  if (isEvmTxHash(t)) return `${BLOCK_EXPLORER_BASE}/tx/${t}`;
+  if (!isStellarTransactionHash(t)) return undefined;
+  const h = String(t).toLowerCase();
   return `${BLOCK_EXPLORER_BASE}/tx/${h}`;
 }
 
@@ -238,10 +263,22 @@ type ExplorerLinkResult = {
  */
 async function finalizeExplorerLinksForTxHash(hash: string): Promise<ExplorerLinkResult> {
   const settlementNetwork = NETWORK === 'stellar:pubnet' ? 'public' : 'testnet';
-  if (!isStellarTransactionHash(hash)) {
-    return { settlementNetwork, settlementWarning: 'Not a 64-character hex Stellar ledger transaction hash.' };
+  if (isEvmTxHash(hash)) {
+    return {
+      settlementNetwork,
+      explorerUrl: `${BLOCK_EXPLORER_BASE}/tx/${hash.trim()}`,
+    };
   }
-  const h = hash.trim().toLowerCase();
+  if (!USE_STELLAR_MPP || !isStellarTransactionHash(hash)) {
+    const ex = ChainScanTxUrl(hash);
+    const unknownFormat = !isStellarTransactionHash(hash) && !isEvmTxHash(hash);
+    return {
+      settlementNetwork,
+      ...(ex ? { explorerUrl: ex } : {}),
+      ...(unknownFormat ? { settlementWarning: 'Not a recognized tx id (expected 0x… EVM or 64-char Stellar ledger hash).' } : {}),
+    };
+  }
+  const h = String(hash).trim().toLowerCase();
   const horizonUrl = `${resolveHorizonBaseUrl()}/transactions/${h}`;
   if (process.env.SKIP_HORIZON_TX_VERIFY === 'true') {
     return {
@@ -268,39 +305,58 @@ async function finalizeExplorerLinksForTxHash(hash: string): Promise<ExplorerLin
 const STELLAR_EXPERT_EXPLORER_HOME =
   BLOCK_EXPLORER_BASE;
 
-// Initialize Mppx Server for Charge Payments
-const mppx = Mppx.create({
-  secretKey: AGENT_PRIVATE_KEY!,
-  methods: [
-    stellar.charge({
-      recipient: SERVER_ADDRESS,
-      currency: TOKEN_SAC_TESTNET,
-      network: NETWORK,
-      store: Store.memory(),
-    }),
-  ],
-});
+/** Stellar `mppx` server — only constructed when `USE_STELLAR_MPP=true` and seeds validate. */
+type StellarMppxChargeServer = {
+  charge: (opts: { amount: string; description: string }) => (req: globalThis.Request) => Promise<{
+    status: number;
+    challenge?: unknown;
+    withReceipt?: (r: globalThis.Response) => globalThis.Response;
+  }>;
+};
 
-if (!AGENT_PRIVATE_KEY) {
-  console.warn('[WARN] AGENT_PRIVATE_KEY (or MPP_SECRET_KEY) not set. Paid routes cannot verify MPP charges.');
-} else if (!HAS_VALID_MPP_SECRET) {
-  console.warn(
-    '[WARN] AGENT_PRIVATE_KEY / MPP_SECRET_KEY is not a valid Stellar secret seed (S...). Running without MPP settlement; set SIMULATION_MODE=true for mock settlement or provide a valid Stellar seed for MPP.',
-  );
-} else if (SERVER_ADDRESS && !isStellarAccountId(SERVER_ADDRESS)) {
-  console.warn(
-    '[WARN] CHARGE_RECIPIENT / MPP_RECIPIENT (or legacy SERVER_ADDRESS / STELLAR_RECIPIENT) is invalid. Expected a G-address for the current payment rail.',
-  );
-} else if (AGENT_PRIVATE_KEY && isStellarAccountId(SERVER_ADDRESS)) {
-  try {
-    const payerPk = Keypair.fromSecret(AGENT_PRIVATE_KEY).publicKey();
-    if (payerPk === SERVER_ADDRESS) {
-      console.warn(
-        '[WARN] MPP payer (AGENT_PRIVATE_KEY) and charge recipient (CHARGE_RECIPIENT/MPP_RECIPIENT; legacy SERVER_ADDRESS/STELLAR_RECIPIENT) are the same G-address. On-chain 0G transfers to self barely change balance; set a separate treasury address for clear settlement.',
-      );
+let stellarMppxServer: StellarMppxChargeServer | undefined;
+
+function getStellarMppxServer(): StellarMppxChargeServer | undefined {
+  if (!USE_STELLAR_MPP || !HAS_VALID_MPP_SECRET || !AGENT_PRIVATE_KEY) return undefined;
+  if (!SERVER_ADDRESS || !isStellarAccountId(SERVER_ADDRESS)) return undefined;
+  if (!stellarMppxServer) {
+    stellarMppxServer = Mppx.create({
+      secretKey: AGENT_PRIVATE_KEY!,
+      methods: [
+        stellar.charge({
+          recipient: SERVER_ADDRESS,
+          currency: TOKEN_SAC_TESTNET,
+          network: NETWORK,
+          store: Store.memory(),
+        }),
+      ],
+    }) as StellarMppxChargeServer;
+  }
+  return stellarMppxServer;
+}
+
+if (USE_STELLAR_MPP) {
+  if (!AGENT_PRIVATE_KEY) {
+    console.warn('[WARN] AGENT_PRIVATE_KEY (or MPP_SECRET_KEY) not set. Stellar MPP paid routes cannot verify charges.');
+  } else if (!HAS_VALID_MPP_SECRET) {
+    console.warn(
+      '[WARN] AGENT_PRIVATE_KEY / MPP_SECRET_KEY is not a valid Stellar secret seed (S...). Set SIMULATION_MODE=true or disable Stellar MPP (USE_STELLAR_MPP unset/false) for 0G EVM rails.',
+    );
+  } else if (SERVER_ADDRESS && !isStellarAccountId(SERVER_ADDRESS)) {
+    console.warn(
+      '[WARN] CHARGE_RECIPIENT / MPP_RECIPIENT (or legacy SERVER_ADDRESS / STELLAR_RECIPIENT) is invalid. Expected a G-address for Stellar MPP.',
+    );
+  } else if (AGENT_PRIVATE_KEY && isStellarAccountId(SERVER_ADDRESS)) {
+    try {
+      const payerPk = Keypair.fromSecret(AGENT_PRIVATE_KEY).publicKey();
+      if (payerPk === SERVER_ADDRESS) {
+        console.warn(
+          '[WARN] MPP payer (AGENT_PRIVATE_KEY) and charge recipient are the same G-address. Use a separate treasury for clear settlement.',
+        );
+      }
+    } catch {
+      /* ignore */
     }
-  } catch {
-    /* ignore */
   }
 }
 
@@ -318,22 +374,6 @@ function internalWorkerHttpBase(): string {
   return `http://${loopHost}:${PORT}`;
 }
 
-let managerMppFetch: typeof globalThis.fetch | undefined;
-
-/** Fetch that completes 0G payment 402 → pay → retry (required for paid internal POSTs). */
-function getManagerMppFetch(): typeof globalThis.fetch {
-  if (!HAS_VALID_MPP_SECRET) return globalThis.fetch;
-  if (!managerMppFetch) {
-    const c = MppxChargeClient.create({
-      methods: [stellarChargeClient.charge({ secretKey: MPP_SECRET_SEED })],
-      polyfill: false,
-      fetch: globalThis.fetch,
-    });
-    managerMppFetch = c.fetch;
-  }
-  return managerMppFetch;
-}
-
 async function callInternalPaidWorker(
   endpoint: string,
   token: string,
@@ -342,11 +382,7 @@ async function callInternalPaidWorker(
   const base = internalWorkerHttpBase();
   const path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const url = `${base}${path}?token=${encodeURIComponent(token)}`;
-  const useMpp =
-    HAS_VALID_MPP_SECRET &&
-    process.env.SIMULATION_MODE !== 'true';
-  const fetcher = useMpp ? getManagerMppFetch() : globalThis.fetch;
-  const res = await fetcher(url, {
+  const res = await globalThis.fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body ?? {}),
@@ -358,10 +394,10 @@ async function callInternalPaidWorker(
   } else {
     data = await res.text().catch(() => '');
   }
-  if (mppSettlementRequired() && res.status !== 200) {
+  if (stellarMppSettlementRequired() && res.status !== 200) {
     const errBody = typeof data === 'string' ? (data as string).slice(0, 500) : JSON.stringify(data).slice(0, 500);
     throw new Error(
-      `[MPP A2A] callInternalPaidWorker: HTTP ${res.status} for POST ${url} (MPP wallet expected to settle). Body: ${errBody}`,
+      `[A2A] callInternalPaidWorker: HTTP ${res.status} for POST ${url} (Stellar MPP requires 200 + settlement). Body: ${errBody}`,
     );
   }
   return { status: res.status, headers: res.headers, data };
@@ -695,8 +731,20 @@ async function logPayment(
     const rawHeader = (req as any)._mppPaymentReceiptRaw as string | undefined;
     if (rawHeader) chainHash = parseTxHashFromPaymentReceiptHeader(rawHeader);
   }
-  const raw = typeof chainHash === 'string' ? chainHash.trim() : '';
-  if (mppSettlementRequired()) {
+  let raw = typeof chainHash === 'string' ? chainHash.trim() : '';
+
+  /** 0G default rail has no Stellar MPP receipt — mint a real tx when strict EVM logging is required. */
+  if (
+    !raw &&
+    process.env.EVM_SETTLEMENT_REQUIRED === 'true' &&
+    process.env.SIMULATION_MODE !== 'true' &&
+    !stellarMppSettlementRequired()
+  ) {
+    const settled = await settleOn0GTestnet(priceConfig.tokenAmount);
+    if (settled?.transaction) raw = settled.transaction.trim();
+  }
+
+  if (stellarMppSettlementRequired()) {
     if (!raw) {
       throw new Error(
         '[MPP logPayment] No on-chain tx hash: receipt.reference empty and Payment-Receipt header missing or unparsed (stage: deferred log after res.json).',
@@ -707,9 +755,21 @@ async function logPayment(
         `[MPP logPayment] Settlement value is not a 64-char hex Stellar ledger tx hash (got: ${JSON.stringify(raw)}).`,
       );
     }
+  } else if (
+    process.env.EVM_SETTLEMENT_REQUIRED === 'true' &&
+    process.env.SIMULATION_MODE !== 'true'
+  ) {
+    if (!raw || !isEvmTxHash(raw)) {
+      throw new Error(
+        `[logPayment] EVM_SETTLEMENT_REQUIRED needs a 0x settlement tx. Enable EVM_SETTLEMENT_ENABLED=true with EVM_SETTLEMENT_PRIVATE_KEY and EVM_SETTLEMENT_RECIPIENT (and ensure EVM_SETTLEMENT_PRIVATE_KEY is a valid 0x hex key). Got: ${JSON.stringify(raw)}.`,
+      );
+    }
   }
   const txId = raw || `sim_${(++paymentIdCounter).toString(16).padStart(8, '0')}`;
-  const linkMeta = raw && isStellarTransactionHash(raw) ? await finalizeExplorerLinksForTxHash(raw) : { settlementNetwork: (NETWORK === 'stellar:pubnet' ? 'public' : 'testnet') as 'testnet' | 'public' };
+  const linkMeta =
+    raw && (isEvmTxHash(raw) || isStellarTransactionHash(raw))
+      ? await finalizeExplorerLinksForTxHash(raw)
+      : { settlementNetwork: (NETWORK === 'stellar:pubnet' ? 'public' : 'testnet') as 'testnet' | 'public' };
 
   const displayAmount = `${priceConfig.tokenAmount} 0G`;
 
@@ -825,11 +885,15 @@ function extractA2aPaymentFromWorkerResponse(
   token: string,
   price: PriceConfig,
 ): { transaction: string; token: string; amount: string; explorerUrl?: string } {
-  const strict = mppSettlementRequired();
+  const strictStellar = stellarMppSettlementRequired();
+  const strictEvm =
+    !strictStellar &&
+    process.env.EVM_SETTLEMENT_REQUIRED === 'true' &&
+    process.env.SIMULATION_MODE !== 'true';
   const pr = readPaymentHeader(headers, 'payment-receipt');
   if (pr) {
     const hash = parseTxHashFromPaymentReceiptHeader(pr);
-    if (hash && isStellarTransactionHash(hash)) {
+    if (hash && (isStellarTransactionHash(hash) || isEvmTxHash(hash))) {
       const ex = ChainScanTxUrl(hash);
       return {
         transaction: hash,
@@ -838,9 +902,14 @@ function extractA2aPaymentFromWorkerResponse(
         ...(ex ? { explorerUrl: ex } : {}),
       };
     }
-    if (strict) {
+    if (strictStellar) {
       throw new Error(
-        `[MPP A2A extractA2aPayment] Payment-Receipt header present but not a valid 64-hex ledger tx (parsed reference=${JSON.stringify(hash)}).`,
+        `[A2A extractA2aPayment] Payment-Receipt header present but not a valid Stellar ledger reference (parsed reference=${JSON.stringify(hash)}).`,
+      );
+    }
+    if (strictEvm) {
+      throw new Error(
+        `[A2A extractA2aPayment] Payment-Receipt header present but not a valid 0x EVM tx (parsed reference=${JSON.stringify(hash)}).`,
       );
     }
   }
@@ -849,17 +918,20 @@ function extractA2aPaymentFromWorkerResponse(
     : undefined;
   if (pay && typeof pay.transaction === 'string' && pay.transaction.trim()) {
     const tx = pay.transaction.trim();
-    if (strict && !isStellarTransactionHash(tx)) {
+    if (strictStellar && !isStellarTransactionHash(tx)) {
       throw new Error(
-        `[MPP A2A extractA2aPayment] JSON body payment.transaction is not a 64-hex Stellar tx (got: ${JSON.stringify(tx)}).`,
+        `[A2A extractA2aPayment] JSON body payment.transaction is not a 64-hex Stellar tx (got: ${JSON.stringify(tx)}).`,
+      );
+    }
+    if (strictEvm && !isEvmTxHash(tx)) {
+      throw new Error(
+        `[A2A extractA2aPayment] JSON body payment.transaction is not a 0x EVM tx (got: ${JSON.stringify(tx)}).`,
       );
     }
     const ex =
       typeof pay.explorerUrl === 'string'
         ? pay.explorerUrl
-        : isStellarTransactionHash(tx)
-          ? ChainScanTxUrl(tx)
-          : undefined;
+        : ChainScanTxUrl(tx);
     return {
       transaction: tx,
       token: typeof pay.token === 'string' ? pay.token : token,
@@ -874,12 +946,17 @@ function extractA2aPaymentFromWorkerResponse(
   const decoded = decodePaymentResponse(legacy);
   if (decoded?.transaction) {
     const tx = decoded.transaction.trim();
-    if (strict && !isStellarTransactionHash(tx)) {
+    if (strictStellar && !isStellarTransactionHash(tx)) {
       throw new Error(
-        `[MPP A2A extractA2aPayment] payment-response / x-payment-response is not a 64-hex Stellar tx (got: ${JSON.stringify(tx)}).`,
+        `[A2A extractA2aPayment] payment-response / x-payment-response is not a 64-hex Stellar tx (got: ${JSON.stringify(tx)}).`,
       );
     }
-    const ex = isStellarTransactionHash(tx) ? ChainScanTxUrl(tx) : undefined;
+    if (strictEvm && !isEvmTxHash(tx)) {
+      throw new Error(
+        `[A2A extractA2aPayment] payment-response / x-payment-response is not a 0x EVM tx (got: ${JSON.stringify(tx)}).`,
+      );
+    }
+    const ex = ChainScanTxUrl(tx);
     return {
       transaction: tx,
       token,
@@ -887,9 +964,9 @@ function extractA2aPaymentFromWorkerResponse(
       ...(ex ? { explorerUrl: ex } : {}),
     };
   }
-  if (strict) {
+  if (strictStellar || strictEvm) {
     throw new Error(
-      '[MPP A2A extractA2aPayment] No settlement found after 200 OK: missing Payment-Receipt, JSON payment.transaction, and legacy payment-response headers.',
+      '[A2A extractA2aPayment] No settlement found after 200 OK: missing Payment-Receipt, JSON payment.transaction, and legacy payment-response headers.',
     );
   }
   return {
@@ -922,7 +999,7 @@ function installMppResJsonPatch(
       try {
         const wrapped = chargeResult.withReceipt(bodyToWebJsonResponse(body)) as globalThis.Response;
         const pr = wrapped.headers.get('Payment-Receipt');
-        if (mppSettlementRequired()) {
+        if (stellarMppSettlementRequired()) {
           if (!pr) {
             throw new Error(
               '[MPP installMppResJsonPatch] withReceipt() returned a Response without Payment-Receipt — settlement not attached to JSON response.',
@@ -955,7 +1032,7 @@ function installMppResJsonPatch(
           }
         }
       } catch (e) {
-        if (mppSettlementRequired()) {
+        if (stellarMppSettlementRequired()) {
           throw e instanceof Error ? e : new Error(String(e));
         }
         console.error('[MPP] withReceipt failed', e);
@@ -1044,8 +1121,24 @@ function createPaidRoute(config: PriceConfig) {
       return;
     }
 
+    if (!USE_STELLAR_MPP) {
+      (req as any).paymentRail = '0g-evm';
+      installMppResJsonPatch(req, res, null);
+      next();
+      return;
+    }
+
     try {
-      const chargeHandler = mppx.charge({
+      const srv = getStellarMppxServer();
+      if (!srv) {
+        res.status(503).json({
+          error: 'Stellar MPP not configured',
+          detail:
+            'USE_STELLAR_MPP=true requires valid Stellar AGENT_PRIVATE_KEY (S...) and CHARGE_RECIPIENT (G...). Or set USE_STELLAR_MPP=false (default) for 0G EVM settlement.',
+        });
+        return;
+      }
+      const chargeHandler = srv.charge({
         amount: config.tokenAmount.toString(),
         description: config.description,
       });
@@ -1372,6 +1465,85 @@ app.get('/api/stats', async (_req: Request, res: Response) => {
     onChain: onChainRegistry,
     uptime: process.uptime(),
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 0G Compute Routes — Specialist Swarm + Account Operations
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.post('/api/0g/swarm/query', async (req: Request, res: Response) => {
+  try {
+    const { query, providerAddress, serviceType, model, strictProvider, strictModel, sessionId } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      res.status(400).json({ error: 'Missing query (string) in request body.' });
+      return;
+    }
+    const result = await runSwarmQuery({
+      query,
+      providerAddress: typeof providerAddress === 'string' ? providerAddress : undefined,
+      serviceType: typeof serviceType === 'string' ? serviceType : undefined,
+      model: typeof model === 'string' ? model : undefined,
+      strictProvider: typeof strictProvider === 'boolean' ? strictProvider : undefined,
+      strictModel: typeof strictModel === 'boolean' ? strictModel : undefined,
+      sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+    });
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[0G SWARM ERROR]', msg);
+    res.status(500).json({ error: '0G swarm query failed', message: msg });
+  }
+});
+
+app.get('/api/0g/swarm/sessions', async (_req: Request, res: Response) => {
+  try {
+    const sessions = await getSwarmSessions();
+    res.json({ count: sessions.length, sessions });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'Failed to load swarm sessions', message: msg });
+  }
+});
+
+app.get('/api/0g/account', async (_req: Request, res: Response) => {
+  try {
+    const account = await getComputeAccountSummary();
+    res.json(account);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'Failed to fetch 0G account', message: msg });
+  }
+});
+
+app.post('/api/0g/account/deposit', async (req: Request, res: Response) => {
+  try {
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ error: 'amount must be a positive number' });
+      return;
+    }
+    await depositToComputeLedger(amount);
+    res.json({ ok: true, action: 'deposit', amount });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: '0G deposit failed', message: msg });
+  }
+});
+
+app.post('/api/0g/account/transfer', async (req: Request, res: Response) => {
+  try {
+    const providerAddress = String(req.body?.providerAddress || '').trim();
+    const amount = String(req.body?.amount || '').trim();
+    if (!providerAddress || !amount) {
+      res.status(400).json({ error: 'providerAddress and amount are required' });
+      return;
+    }
+    await transferToInferenceProvider(providerAddress, amount);
+    res.json({ ok: true, action: 'transfer', providerAddress, amount });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: '0G transfer failed', message: msg });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2037,6 +2209,35 @@ interface AgentExecutionResult {
   }>;
 }
 
+function mapSwarmSessionToAgentExecution(session: SwarmSession): AgentExecutionResult {
+  const plan = session.steps.map((s) => `[${s.role.toUpperCase()}] ${s.output.slice(0, 220)}`);
+  const protocolTrace = session.steps.map((s) => ({
+    step: `0G Compute ${s.role}`,
+    httpStatus: 200,
+    headers: {
+      'x-provider': s.providerAddress,
+      'x-model': s.model,
+      'x-tee-verified': String(s.teeVerified ?? ''),
+      ...(s.chatId ? { 'zg-res-key': s.chatId } : {}),
+    },
+    timestamp: s.timestamp,
+  }));
+  return {
+    query: session.query,
+    plan,
+    hiringDecisions: [],
+    results: session.steps.map((s) => ({
+      tool: `0g-${s.role}`,
+      result: s.output,
+      payment: undefined,
+    })),
+    finalAnswer: session.finalAnswer,
+    totalCost: { tokenAmount: 0, tokenBaseUnits: 0 },
+    a2aDepth: 1,
+    protocolTrace,
+  };
+}
+
 /**
  * Autonomous Cost-Evaluation Logic
  * The Manager Agent evaluates cost vs. reputation before signing x402 payloads
@@ -2083,11 +2284,13 @@ function autonomousHiringDecision(
 /** Rich error text when a manager hire fails (used instead of silent sim_fallback when real settlement is required). */
 function formatManagerToolFailure(err: unknown, endpoint: string, toolId: string): string {
   const e = err as { message?: string; response?: { status?: number; data?: unknown; headers?: unknown }; stack?: string };
-  const settlementPolicy = HAS_VALID_MPP_SECRET
-    ? 'Refusing simulation fallback while valid MPP secrets are configured (set SIMULATION_MODE=true to allow mock settlement).'
-    : 'Simulation fallback is disabled because no valid MPP Stellar seed is configured for this process.';
+  const settlementPolicy = stellarMppSettlementRequired()
+    ? 'Refusing simulation fallback while Stellar MPP settlement is enabled (set SIMULATION_MODE=true to allow mock settlement).'
+    : process.env.EVM_SETTLEMENT_REQUIRED === 'true' && process.env.SIMULATION_MODE !== 'true'
+      ? 'Refusing simulation fallback while EVM_SETTLEMENT_REQUIRED=true.'
+      : 'Simulation fallback blocked by settlement policy.';
   const lines = [
-    `[MPP A2A] Manager hire failed for toolId="${toolId}" endpoint="${endpoint}".`,
+    `[A2A] Manager hire failed for toolId="${toolId}" endpoint="${endpoint}".`,
     settlementPolicy,
     `cause.message=${e?.message || String(err)}`,
   ];
@@ -2168,9 +2371,54 @@ async function runManagerAgent(
   query: string,
   token: string,
   clientId?: string,
-  options: { budgetLimit?: number; recursiveDepth?: number; userReputation?: number } = {}
+  options: {
+    budgetLimit?: number;
+    recursiveDepth?: number;
+    userReputation?: number;
+    use0gCompute?: boolean;
+    serviceType?: string;
+    providerAddress?: string;
+    model?: string;
+    strictProvider?: boolean;
+    strictModel?: boolean;
+    sessionId?: string;
+  } = {}
 ): Promise<AgentExecutionResult> {
-  const { budgetLimit = 0.5, recursiveDepth = 0, userReputation = 65 } = options; // Defaults
+  const {
+    budgetLimit = 0.5,
+    recursiveDepth = 0,
+    userReputation = 65,
+    use0gCompute = ZG_SWARM_DEFAULT,
+    serviceType,
+    providerAddress,
+    model,
+    strictProvider,
+    strictModel,
+    sessionId,
+  } = options; // Defaults
+
+  if (use0gCompute) {
+    const session = await runSwarmQuery({
+      query,
+      serviceType,
+      providerAddress,
+      model,
+      strictProvider,
+      strictModel,
+      sessionId,
+    });
+    if (clientId) {
+      for (const step of session.steps) {
+        sendSSETo(clientId, 'step', {
+          label: `0G ${step.role}`,
+          detail: `${step.model} @ ${step.providerAddress.slice(0, 10)}…`,
+          status: 'complete',
+        });
+      }
+    }
+    return mapSwarmSessionToAgentExecution(session);
+  }
+
   const startTime = Date.now();
   const plan: string[] = [];
   const hiringDecisions: AgentExecutionResult['hiringDecisions'] = [];
@@ -2354,6 +2602,8 @@ Return ONLY valid JSON:
     let toolResult: any;
 
     const endpointMap: Record<string, string> = {
+      weather: 'weather',
+      summarize: 'summarize',
       mathSolve: 'math-solve',
       sentiment: 'sentiment',
       codeExplain: 'code-explain',
@@ -2495,15 +2745,25 @@ Return ONLY valid JSON:
             });
 
             try {
-              const fallbackEndpoint = `/api/${endpointMap[toolId] || toolId}`;
-              const fb = await callInternalPaidWorker(fallbackEndpoint, token, internalBody);
+              const fallbackEndpoint = fallbackAgent.endpoint.startsWith('/')
+                ? fallbackAgent.endpoint
+                : `/${fallbackAgent.endpoint}`;
+              const fbBody = buildManagerInternalWorkerBody(toolId, fallbackEndpoint, tc.params, query);
+              const fb = await callInternalPaidWorker(fallbackEndpoint, token, fbBody);
               if (fb.status >= 400) {
                 const err: any = new Error(`HTTP ${fb.status}`);
                 err.response = { status: fb.status, headers: Object.fromEntries(fb.headers.entries()), data: fb.data };
                 throw err;
               }
               const fallbackData = fb.data as Record<string, unknown>;
-              toolResult = fallbackData.result || fallbackData.weather || fallbackData.summary || fallbackData;
+              toolResult =
+                fallbackData.result ||
+                fallbackData.weather ||
+                fallbackData.summary ||
+                fallbackData.sentiment ||
+                fallbackData.explanation ||
+                fallbackData.translation ||
+                fallbackData;
               const fallbackPrice: PriceConfig = {
                 tokenAmount: fallbackAgent.price0G,
                 tokenBaseUnits: fallbackAgent.priceDrops,
@@ -2532,7 +2792,7 @@ Return ONLY valid JSON:
               const fallbackPaymentLog: PaymentLog = {
                 id: `pay_${(++paymentIdCounter).toString(36)}`,
                 timestamp: new Date().toISOString(),
-                endpoint: `/api/${endpointMap[toolId] || toolId}`,
+                endpoint: fallbackEndpoint,
                 payer: 'Manager Agent',
                 worker: fallbackName,
                 transaction: payment.transaction,
@@ -2575,7 +2835,7 @@ Return ONLY valid JSON:
         }
 
         if (!healed) {
-          if (mppSettlementRequired()) {
+          if (disallowSimulationFallback()) {
             throw new Error(formatManagerToolFailure(err, endpoint, toolId));
           }
           // Fallback to simulation when all retries exhaust (only when not requiring on-chain settlement)

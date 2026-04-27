@@ -100,10 +100,7 @@ export default function TransactionLog({ refreshTrigger }: Props) {
 
 function PaymentCard({ payment }: { payment: Payment }) {
   const { t } = useI18n();
-  const explorerBase = (process.env.NEXT_PUBLIC_BLOCK_EXPLORER || 'https://chainscan-galileo.0g.ai').replace(/\/$/, '');
-  const explorerUrl =
-    payment.explorerUrl ||
-    (/^0x[a-fA-F0-9]{64}$/.test(payment.transaction || '') ? `${explorerBase}/tx/${payment.transaction}` : undefined);
+  const explorerUrl = payment.explorerUrl;
   const horizonUrl = payment.horizonUrl;
   const settlementWarning =
     typeof payment.metadata?.settlementWarning === 'string' ? payment.metadata.settlementWarning : undefined;
