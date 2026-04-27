@@ -49,10 +49,14 @@ import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
 import { createWalletClient, http, isAddress, parseEther, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  bootstrapComputeAccount,
   depositToComputeLedger,
   getComputeAccountSummary,
+  getSharedMemoryPointer,
+  getSwarmMemoryEvents,
   getSwarmSessions,
   runSwarmQuery,
+  setSharedMemoryPointer,
   transferToInferenceProvider,
 } from './zgCompute/swarm.js';
 import type { SwarmSession } from './zgCompute/swarm.js';
@@ -1505,6 +1509,63 @@ app.get('/api/0g/swarm/sessions', async (_req: Request, res: Response) => {
   }
 });
 
+app.get('/api/0g/swarm/shared-root', async (_req: Request, res: Response) => {
+  try {
+    const pointer = await getSharedMemoryPointer();
+    res.json(pointer);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'Failed to fetch shared memory root', message: msg });
+  }
+});
+
+app.post('/api/0g/swarm/shared-root', async (req: Request, res: Response) => {
+  try {
+    const rootHash = String(req.body?.rootHash || '').trim();
+    const syncNow = typeof req.body?.syncNow === 'boolean' ? req.body.syncNow : true;
+    const replaceLocal = typeof req.body?.replaceLocal === 'boolean' ? req.body.replaceLocal : true;
+    if (!rootHash) {
+      res.status(400).json({ error: 'rootHash is required' });
+      return;
+    }
+    const updated = await setSharedMemoryPointer(rootHash, { syncNow, replaceLocal });
+    res.json({ ok: true, ...updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'Failed to set shared memory root', message: msg });
+  }
+});
+
+app.get('/api/0g/swarm/events', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let since = typeof req.query?.since === 'string' ? req.query.since : undefined;
+  const send = () => {
+    const events = getSwarmMemoryEvents(since);
+    if (events.length === 0) return;
+    for (const ev of events) {
+      res.write(`event: swarm_event\n`);
+      res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    }
+    since = events[events.length - 1]?.ts || since;
+  };
+
+  send();
+  const timer = setInterval(send, 1000);
+  const keepAlive = setInterval(() => {
+    res.write(': keepalive\n\n');
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(timer);
+    clearInterval(keepAlive);
+    res.end();
+  });
+});
+
 app.get('/api/0g/account', async (_req: Request, res: Response) => {
   try {
     const account = await getComputeAccountSummary();
@@ -1543,6 +1604,16 @@ app.post('/api/0g/account/transfer', async (req: Request, res: Response) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: '0G transfer failed', message: msg });
+  }
+});
+
+app.post('/api/0g/account/bootstrap', async (_req: Request, res: Response) => {
+  try {
+    const out = await bootstrapComputeAccount();
+    res.json(out);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: '0G account bootstrap failed', message: msg });
   }
 });
 
@@ -2382,6 +2453,8 @@ async function runManagerAgent(
     strictProvider?: boolean;
     strictModel?: boolean;
     sessionId?: string;
+    hybridSwarmCoordinator?: boolean;
+    autoBootstrap0gAccount?: boolean;
   } = {}
 ): Promise<AgentExecutionResult> {
   const {
@@ -2395,6 +2468,8 @@ async function runManagerAgent(
     strictProvider,
     strictModel,
     sessionId,
+    hybridSwarmCoordinator = process.env.ZG_HYBRID_SWARM_COORDINATOR !== 'false',
+    autoBootstrap0gAccount = process.env.ZG_COMPUTE_AUTO_BOOTSTRAP !== 'false',
   } = options; // Defaults
 
   if (use0gCompute) {
@@ -2417,6 +2492,31 @@ async function runManagerAgent(
       }
     }
     return mapSwarmSessionToAgentExecution(session);
+  }
+
+  let coordinatorSession: SwarmSession | null = null;
+  if (hybridSwarmCoordinator) {
+    try {
+      if (autoBootstrap0gAccount) {
+        await bootstrapComputeAccount();
+      }
+      coordinatorSession = await runSwarmQuery({
+        query,
+        serviceType: serviceType || 'chatbot',
+        providerAddress,
+        model,
+        strictProvider: typeof strictProvider === 'boolean' ? strictProvider : false,
+        strictModel: typeof strictModel === 'boolean' ? strictModel : false,
+        sessionId,
+      });
+      if (clientId) {
+        sendSSETo(clientId, 'thought', {
+          content: `0G coordinator session ${coordinatorSession.id} produced ${coordinatorSession.steps.length} steps for manager context.`,
+        });
+      }
+    } catch (err) {
+      console.warn('[HYBRID SWARM] Coordinator pre-pass failed; continuing with manager planner.', err);
+    }
   }
 
   const startTime = Date.now();
@@ -2462,6 +2562,7 @@ CRITICAL: You are an AUTONOMOUS DECISION MAKER. You must:
 5. Explain WHY you chose each worker (cost-efficiency vs quality reasoning).
 
 User Query: "${query}"
+${coordinatorSession ? `\n0G Swarm Context (planner/researcher/critic/executor pre-pass):\n${coordinatorSession.steps.map((s) => `- ${s.role}: ${s.output.slice(0, 500)}`).join('\n')}\n` : ''}
 
 Return ONLY valid JSON:
 {

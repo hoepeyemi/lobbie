@@ -18,6 +18,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.6",
     "@0glabs/0g-serving-broker": "^0.7.5",
     "@google/generative-ai": "^0.24.1",
     "@stellar/mpp": "^0.4.0",
@@ -29,7 +30,7 @@
     "axios": "^1.13.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "ethers": "^6.16.0",
+    "ethers": "^6.13.1",
     "express": "^4.21.2",
     "groq-sdk": "^0.37.0",
     "helmet": "^8.0.0",

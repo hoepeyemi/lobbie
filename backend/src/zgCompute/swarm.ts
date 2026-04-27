@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { ethers } from 'ethers';
+import { Indexer, MemData } from '@0gfoundation/0g-ts-sdk';
 
 const require = createRequire(import.meta.url);
 const {
@@ -34,6 +35,22 @@ export type SwarmSession = {
   finalAnswer: string;
 };
 
+export type SwarmMemoryEvent = {
+  id: string;
+  ts: string;
+  type:
+    | 'session_started'
+    | 'step_completed'
+    | 'session_completed'
+    | 'root_published'
+    | 'pointer_updated'
+    | 'pointer_synced';
+  sessionId?: string;
+  role?: SwarmRole;
+  rootHash?: string;
+  detail?: string;
+};
+
 type InferenceService = {
   provider: string;
   serviceType: string;
@@ -48,15 +65,38 @@ const DEFAULT_SERVICE_TYPE = (process.env.ZG_COMPUTE_SERVICE_TYPE || 'chatbot').
 const AUTO_FUND_ENABLED = process.env.ZG_COMPUTE_AUTO_FUND !== 'false';
 const AUTO_FUND_MIN_SUBACCOUNT_0G = Number(process.env.ZG_COMPUTE_MIN_SUBACCOUNT_0G || '1');
 const AUTO_FUND_TOPUP_0G = Number(process.env.ZG_COMPUTE_TOPUP_0G || '1');
+const ZG_COMPUTE_BOOTSTRAP_DEPOSIT_0G = Number(process.env.ZG_COMPUTE_BOOTSTRAP_DEPOSIT_0G || '3');
+const ZG_SHARED_MEMORY_ENABLED = process.env.ZG_SHARED_MEMORY_ENABLED === 'true';
+const ZG_STORAGE_INDEXER_RPC = (
+  process.env.ZG_STORAGE_INDEXER_RPC || 'https://indexer-storage-testnet-turbo.0g.ai'
+).trim();
+const ZG_STORAGE_MEMORY_ROOT_HASH = (process.env.ZG_STORAGE_MEMORY_ROOT_HASH || '').trim();
 
 const MEMORY_PATH = path.resolve(process.cwd(), 'data', 'swarm-memory.json');
+const MEMORY_ROOT_PATH = path.resolve(process.cwd(), 'data', 'swarm-memory.root.json');
 const memory = new Map<string, SwarmSession>();
+const swarmEvents: SwarmMemoryEvent[] = [];
+let latestMemoryRootHash = ZG_STORAGE_MEMORY_ROOT_HASH;
+let sharedMemoryWarned = false;
+const INSTANCE_ID = process.env.ZG_INSTANCE_ID || `inst_${Math.random().toString(36).slice(2, 8)}`;
 
 let loaded = false;
 
 async function ensureLoaded(): Promise<void> {
   if (loaded) return;
   loaded = true;
+  if (ZG_SHARED_MEMORY_ENABLED) {
+    try {
+      const sessions = await readSessionsFromSharedStorage();
+      for (const s of sessions) memory.set(s.id, s);
+      if (sessions.length > 0) return;
+    } catch (err) {
+      if (!sharedMemoryWarned) {
+        console.warn('[0G STORAGE] Failed to load shared swarm memory, falling back to local file.', err);
+        sharedMemoryWarned = true;
+      }
+    }
+  }
   try {
     const raw = await fs.readFile(MEMORY_PATH, 'utf8');
     const sessions = JSON.parse(raw) as SwarmSession[];
@@ -67,9 +107,50 @@ async function ensureLoaded(): Promise<void> {
 }
 
 async function persist(): Promise<void> {
-  await fs.mkdir(path.dirname(MEMORY_PATH), { recursive: true });
   const sessions = [...memory.values()].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
-  await fs.writeFile(MEMORY_PATH, JSON.stringify(sessions, null, 2), 'utf8');
+  const json = JSON.stringify(sessions, null, 2);
+  await writeLocalMemorySnapshot(json);
+  if (!ZG_SHARED_MEMORY_ENABLED) return;
+
+  try {
+    const rootHash = await uploadSessionsToSharedStorage(json);
+    latestMemoryRootHash = rootHash;
+    await fs.writeFile(
+      MEMORY_ROOT_PATH,
+      JSON.stringify({ rootHash, updatedAt: new Date().toISOString() }, null, 2),
+      'utf8',
+    );
+    publishSwarmEvent({
+      type: 'root_published',
+      rootHash,
+      detail: `instance=${INSTANCE_ID}`,
+    });
+  } catch (err) {
+    if (!sharedMemoryWarned) {
+      console.warn('[0G STORAGE] Failed to persist shared swarm memory; local fallback remains active.', err);
+      sharedMemoryWarned = true;
+    }
+  }
+}
+
+function newEventId(): string {
+  return `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function publishSwarmEvent(input: Omit<SwarmMemoryEvent, 'id' | 'ts'>): void {
+  swarmEvents.push({
+    id: newEventId(),
+    ts: new Date().toISOString(),
+    ...input,
+  });
+  if (swarmEvents.length > 1000) {
+    swarmEvents.splice(0, swarmEvents.length - 1000);
+  }
+}
+
+async function writeLocalMemorySnapshot(json: string): Promise<void> {
+  await fs.mkdir(path.dirname(MEMORY_PATH), { recursive: true });
+  await fs.writeFile(MEMORY_PATH, json, 'utf8');
 }
 
 function newSessionId(): string {
@@ -79,6 +160,139 @@ function newSessionId(): string {
 function isHexPrivateKey(value: string): boolean {
   const h = value.startsWith('0x') ? value : `0x${value}`;
   return /^0x[0-9a-fA-F]{64}$/.test(h);
+}
+
+function getStorageSigner(): ethers.Wallet {
+  const pk = (process.env.ZG_STORAGE_PRIVATE_KEY || process.env.ZG_COMPUTE_PRIVATE_KEY || process.env.EVM_SETTLEMENT_PRIVATE_KEY || '').trim();
+  if (!pk || !isHexPrivateKey(pk)) {
+    throw new Error(
+      'ZG_STORAGE_PRIVATE_KEY (or ZG_COMPUTE_PRIVATE_KEY / EVM_SETTLEMENT_PRIVATE_KEY) must be a valid 0x-prefixed EVM key for 0G Storage uploads.',
+    );
+  }
+  const provider = new ethers.JsonRpcProvider(DEFAULT_RPC);
+  return new ethers.Wallet(pk.startsWith('0x') ? pk : `0x${pk}`, provider);
+}
+
+function getMemoryRootFromTx(tx: any): string | null {
+  if (!tx || typeof tx !== 'object') return null;
+  if (typeof tx.rootHash === 'string' && tx.rootHash.trim()) return tx.rootHash.trim();
+  if (Array.isArray(tx.rootHashes) && typeof tx.rootHashes[0] === 'string') return String(tx.rootHashes[0]).trim();
+  return null;
+}
+
+async function resolveLatestSharedMemoryRoot(): Promise<string | null> {
+  if (latestMemoryRootHash) return latestMemoryRootHash;
+  try {
+    const raw = await fs.readFile(MEMORY_ROOT_PATH, 'utf8');
+    const parsed = JSON.parse(raw) as { rootHash?: string };
+    const root = typeof parsed.rootHash === 'string' ? parsed.rootHash.trim() : '';
+    if (root) {
+      latestMemoryRootHash = root;
+      return root;
+    }
+  } catch {
+    // no-op
+  }
+  return null;
+}
+
+async function persistRootPointer(rootHash: string): Promise<void> {
+  await fs.mkdir(path.dirname(MEMORY_ROOT_PATH), { recursive: true });
+  await fs.writeFile(
+    MEMORY_ROOT_PATH,
+    JSON.stringify({ rootHash, updatedAt: new Date().toISOString() }, null, 2),
+    'utf8',
+  );
+}
+
+function normalizeSessions(raw: unknown): SwarmSession[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x): x is SwarmSession => {
+    return Boolean(
+      x &&
+      typeof x === 'object' &&
+      typeof (x as SwarmSession).id === 'string' &&
+      typeof (x as SwarmSession).query === 'string' &&
+      Array.isArray((x as SwarmSession).steps),
+    );
+  });
+}
+
+async function uploadSessionsToSharedStorage(json: string): Promise<string> {
+  const indexer = new Indexer(ZG_STORAGE_INDEXER_RPC);
+  const signer = getStorageSigner();
+  const data = new TextEncoder().encode(json);
+  const memData = new MemData(data);
+  const [, treeErr] = await memData.merkleTree();
+  if (treeErr) throw new Error(`0G Storage merkleTree failed: ${String(treeErr)}`);
+  const [tx, uploadErr] = await indexer.upload(memData, DEFAULT_RPC, signer as any);
+  if (uploadErr) throw new Error(`0G Storage upload failed: ${String(uploadErr)}`);
+  const rootHash = getMemoryRootFromTx(tx);
+  if (!rootHash) throw new Error('0G Storage upload succeeded but rootHash was missing.');
+  return rootHash;
+}
+
+async function readSessionsFromSharedStorage(): Promise<SwarmSession[]> {
+  const rootHash = await resolveLatestSharedMemoryRoot();
+  if (!rootHash) return [];
+  const indexer = new Indexer(ZG_STORAGE_INDEXER_RPC);
+  const [blob, dlErr] = await indexer.downloadToBlob(rootHash, { proof: true });
+  if (dlErr) throw new Error(`0G Storage download failed: ${String(dlErr)}`);
+  const text = typeof (blob as Blob).text === 'function'
+    ? await (blob as Blob).text()
+    : Buffer.from(await (blob as any).arrayBuffer()).toString('utf8');
+  return normalizeSessions(JSON.parse(text));
+}
+
+export async function getSharedMemoryPointer(): Promise<{
+  enabled: boolean;
+  indexerRpc: string;
+  rootHash: string | null;
+  localSessionCount: number;
+}> {
+  await ensureLoaded();
+  return {
+    enabled: ZG_SHARED_MEMORY_ENABLED,
+    indexerRpc: ZG_STORAGE_INDEXER_RPC,
+    rootHash: await resolveLatestSharedMemoryRoot(),
+    localSessionCount: memory.size,
+  };
+}
+
+export async function setSharedMemoryPointer(
+  rootHash: string,
+  opts: { syncNow?: boolean; replaceLocal?: boolean } = {},
+): Promise<{ rootHash: string; synced: boolean; loadedSessions: number }> {
+  const nextRoot = String(rootHash || '').trim();
+  if (!nextRoot) throw new Error('rootHash is required.');
+  latestMemoryRootHash = nextRoot;
+  await persistRootPointer(nextRoot);
+  publishSwarmEvent({
+    type: 'pointer_updated',
+    rootHash: nextRoot,
+    detail: `syncNow=${opts.syncNow !== false}`,
+  });
+
+  const syncNow = opts.syncNow !== false;
+  if (!syncNow) return { rootHash: nextRoot, synced: false, loadedSessions: 0 };
+
+  const sessions = await readSessionsFromSharedStorage();
+  if (opts.replaceLocal !== false) memory.clear();
+  for (const s of sessions) memory.set(s.id, s);
+  await writeLocalMemorySnapshot(JSON.stringify([...memory.values()], null, 2));
+  publishSwarmEvent({
+    type: 'pointer_synced',
+    rootHash: nextRoot,
+    detail: `loadedSessions=${sessions.length}`,
+  });
+  return { rootHash: nextRoot, synced: true, loadedSessions: sessions.length };
+}
+
+export function getSwarmMemoryEvents(sinceIso?: string): SwarmMemoryEvent[] {
+  if (!sinceIso) return [...swarmEvents];
+  const since = Date.parse(sinceIso);
+  if (!Number.isFinite(since)) return [...swarmEvents];
+  return swarmEvents.filter((e) => Date.parse(e.ts) > since);
 }
 
 async function initWritableBroker(): Promise<any> {
@@ -152,7 +366,7 @@ async function autoFundProviderIfNeeded(broker: any, providerAddress: string): P
   }
   if (subBal >= minRequired) return;
 
-  const ledger = await broker.ledger.getLedger();
+  const ledger = await getOrCreateLedger(broker);
   const available = BigInt(ledger?.availableBalance ?? 0n);
   if (available < topUpAmount) {
     throw new Error(
@@ -160,6 +374,102 @@ async function autoFundProviderIfNeeded(broker: any, providerAddress: string): P
     );
   }
   await broker.ledger.transferFund(providerAddress, 'inference', topUpAmount);
+}
+
+function isMissingLedgerError(err: unknown): boolean {
+  const e = err as { message?: string; reason?: string; shortMessage?: string };
+  const blob = `${e?.message || ''} ${e?.reason || ''} ${e?.shortMessage || ''}`.toLowerCase();
+  return blob.includes('ledgernotexists') || blob.includes('account does not exist') || blob.includes('add-account');
+}
+
+/** Matches `@0glabs/0g-serving-broker` LedgerProcessor.MIN_LEDGER_BALANCE_OG */
+const MIN_LEDGER_OG = 3;
+
+function bootstrapAmountOg(): number {
+  return Math.max(MIN_LEDGER_OG, ZG_COMPUTE_BOOTSTRAP_DEPOSIT_0G || 0);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * After addLedger/depositFund txs, RPC read can lag — poll until getLedger succeeds.
+ */
+async function waitForLedgerAfterCreate(broker: any, opts: { attempts?: number; delayMs?: number } = {}): Promise<any> {
+  const attempts = opts.attempts ?? 20;
+  const delayMs = opts.delayMs ?? 1500;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await broker.ledger.getLedger();
+    } catch (e) {
+      lastErr = e;
+      if (!isMissingLedgerError(e)) throw e;
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error(`getLedger still failing after ${attempts} attempts (~${Math.round((attempts * delayMs) / 1000)}s wait).`);
+}
+
+/**
+ * Creates the on-chain ledger if missing (`LedgerNotExists`).
+ * Uses broker SDK order: depositFund first (creates ledger when ≥3 0G), then addLedger fallback.
+ * Requires native 0G on the wallet for msg.value + gas (Galileo testnet).
+ */
+async function ensureComputeLedgerExists(broker: any): Promise<void> {
+  try {
+    await broker.ledger.getLedger();
+    return;
+  } catch (e) {
+    if (!isMissingLedgerError(e)) throw e;
+  }
+
+  const amt = bootstrapAmountOg();
+  const errs: string[] = [];
+
+  if (typeof broker?.ledger?.depositFund === 'function') {
+    try {
+      await broker.ledger.depositFund(amt);
+      await waitForLedgerAfterCreate(broker);
+      return;
+    } catch (e) {
+      errs.push(`depositFund(${amt} 0G): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (typeof broker?.ledger?.addLedger === 'function') {
+    try {
+      await broker.ledger.addLedger(amt);
+      await waitForLedgerAfterCreate(broker);
+      return;
+    } catch (e) {
+      errs.push(`addLedger(${amt} 0G): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  throw new Error(
+    [
+      `Could not create a 0G Compute ledger for this wallet on chain ${process.env.CHAIN_ID || '16602'}.`,
+      `You need at least ${amt} native 0G (plus gas) in the wallet used by ZG_COMPUTE_PRIVATE_KEY.`,
+      `CLI equivalent: npx 0g-compute-cli add-account (or depositFund/addLedger via broker).`,
+      errs.length ? `Attempts:\n${errs.join('\n')}` : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
+  );
+}
+
+async function getOrCreateLedger(broker: any): Promise<any> {
+  try {
+    return await broker.ledger.getLedger();
+  } catch (err) {
+    if (!isMissingLedgerError(err)) throw err;
+    await ensureComputeLedgerExists(broker);
+    return await broker.ledger.getLedger();
+  }
 }
 
 async function callInference(
@@ -276,6 +586,12 @@ export async function runSwarmQuery(input: {
       finalAnswer: '',
     };
 
+  publishSwarmEvent({
+    type: 'session_started',
+    sessionId: session.id,
+    detail: `query="${input.query.slice(0, 120)}"`,
+  });
+
   const roles: SwarmRole[] = ['planner', 'researcher', 'critic', 'executor'];
   let rollingContext = session.steps.map((s) => `${s.role}: ${s.output}`).join('\n\n');
   rollingContext = rollingContext.slice(-10_000);
@@ -294,6 +610,19 @@ export async function runSwarmQuery(input: {
       timestamp: new Date().toISOString(),
     };
     session.steps.push(step);
+    session.updatedAt = new Date().toISOString();
+    memory.set(session.id, session);
+    if (ZG_SHARED_MEMORY_ENABLED) {
+      // Publish each role completion to shared storage for near real-time cross-instance sync.
+      await persist();
+    }
+    publishSwarmEvent({
+      type: 'step_completed',
+      sessionId: session.id,
+      role,
+      detail: `${r.model} @ ${service.provider}`,
+      rootHash: latestMemoryRootHash || undefined,
+    });
     rollingContext = `${rollingContext}\n\n${role.toUpperCase()}: ${r.output}`.slice(-12_000);
   }
 
@@ -302,6 +631,11 @@ export async function runSwarmQuery(input: {
   session.updatedAt = new Date().toISOString();
   memory.set(session.id, session);
   await persist();
+  publishSwarmEvent({
+    type: 'session_completed',
+    sessionId: session.id,
+    rootHash: latestMemoryRootHash || undefined,
+  });
   return session;
 }
 
@@ -315,7 +649,7 @@ export async function getComputeAccountSummary(): Promise<{
   availableBalance: string;
 }> {
   const broker = await initWritableBroker();
-  const ledger = await broker.ledger.getLedger();
+  const ledger = await getOrCreateLedger(broker);
   return {
     totalBalance: ethers.formatEther(ledger.totalBalance),
     availableBalance: ethers.formatEther(ledger.availableBalance),
@@ -324,11 +658,57 @@ export async function getComputeAccountSummary(): Promise<{
 
 export async function depositToComputeLedger(amount0G: number): Promise<void> {
   const broker = await initWritableBroker();
-  await broker.ledger.depositFund(amount0G);
+  const amountWei = ethers.parseEther(String(amount0G));
+  try {
+    await broker.ledger.depositFund(amount0G);
+    return;
+  } catch {
+    try {
+      await broker.ledger.depositFund(String(amount0G));
+      return;
+    } catch {
+      await broker.ledger.depositFund(amountWei);
+    }
+  }
 }
 
 export async function transferToInferenceProvider(providerAddress: string, amount0G: string): Promise<void> {
   const broker = await initWritableBroker();
   await broker.ledger.transferFund(providerAddress, 'inference', ethers.parseEther(amount0G));
+}
+
+export async function bootstrapComputeAccount(): Promise<{
+  ok: boolean;
+  ledgerCreated: boolean;
+  bootstrapAmountOg: number;
+  totalBalance?: string;
+  availableBalance?: string;
+}> {
+  const broker = await initWritableBroker();
+  let ledgerCreated = false;
+
+  try {
+    const ledger = await broker.ledger.getLedger();
+    return {
+      ok: true,
+      ledgerCreated,
+      bootstrapAmountOg: bootstrapAmountOg(),
+      totalBalance: ethers.formatEther(ledger.totalBalance ?? 0n),
+      availableBalance: ethers.formatEther(ledger.availableBalance ?? 0n),
+    };
+  } catch (err) {
+    if (!isMissingLedgerError(err)) throw err;
+  }
+
+  ledgerCreated = true;
+  await ensureComputeLedgerExists(broker);
+  const ledger = await broker.ledger.getLedger();
+  return {
+    ok: true,
+    ledgerCreated,
+    bootstrapAmountOg: bootstrapAmountOg(),
+    totalBalance: ethers.formatEther(ledger.totalBalance ?? 0n),
+    availableBalance: ethers.formatEther(ledger.availableBalance ?? 0n),
+  };
 }
 
