@@ -29,6 +29,7 @@
  *   GET  /api/stats             — Economy statistics
  *   GET  /api/agent/events      — SSE stream
  *   POST /api/agent/query       — Agent orchestration entry
+ *   GET  /api/ens/*             — ENS (Ethereum L1): display name, profile, agent binding
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -48,6 +49,16 @@ import { fetchOnChainRegistry } from './evm/onChainRegistry.js';
 import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
 import { createWalletClient, http, isAddress, parseEther, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import {
+  checkSubnameCapability,
+  ensResolutionEnabled,
+  resolveAddressProfile,
+  forwardResolveEnsName,
+  reverseResolveAddress,
+  fetchEnsAgentProfile,
+  getConfiguredAgentEnsSummary,
+  normalizeEnsName,
+} from './ens/identity.js';
 import {
   bootstrapComputeAccount,
   depositToComputeLedger,
@@ -1271,7 +1282,172 @@ app.get('/health', (_req: Request, res: Response) => {
     version: '2.0.0',
     agents: agentRegistry.length,
     totalPayments: paymentLogs.length,
+    ens: { enabled: ensResolutionEnabled() },
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Routes — ENS (L1) identity: forward / reverse / text records
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.get('/api/ens/display', async (req: Request, res: Response) => {
+  const raw = String(req.query.address || '').trim();
+  if (!raw || !isAddress(raw)) {
+    res.status(400).json({ error: 'Query "address" must be a valid 0x EVM address' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({
+      address: raw,
+      ensName: null,
+      display: `${raw.slice(0, 6)}…${raw.slice(-4)}`,
+    });
+    return;
+  }
+  try {
+    const { ensName } = await reverseResolveAddress(raw as Address);
+    res.json({
+      address: raw,
+      ensName,
+      display: ensName || `${raw.slice(0, 6)}…${raw.slice(-4)}`,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS reverse resolution failed', message: msg });
+  }
+});
+
+app.get('/api/ens/profile', async (req: Request, res: Response) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'Query "name" is required (e.g. myagent.eth)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, name, profile: null });
+    return;
+  }
+  if (!normalizeEnsName(name)) {
+    res.status(400).json({ error: 'Invalid or non-ENS name' });
+    return;
+  }
+  try {
+    const profile = await fetchEnsAgentProfile(name);
+    res.json({ enabled: true, name: profile?.name || name, profile });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS profile fetch failed', message: msg });
+  }
+});
+
+app.get('/api/ens/forward', async (req: Request, res: Response) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'Query "name" is required' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, name, address: null });
+    return;
+  }
+  if (!normalizeEnsName(name)) {
+    res.status(400).json({ error: 'Invalid or non-ENS name' });
+    return;
+  }
+  try {
+    const address = await forwardResolveEnsName(name);
+    res.json({ enabled: true, name, address });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS forward resolution failed', message: msg });
+  }
+});
+
+app.get('/api/ens/agent', async (_req: Request, res: Response) => {
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, summary: null });
+    return;
+  }
+  try {
+    const summary = await getConfiguredAgentEnsSummary();
+    if (!summary) {
+      res.json({
+        enabled: true,
+        summary: null,
+        hint: 'Set ENS_AGENT_NAME in the environment to bind an .eth name to this server',
+      });
+      return;
+    }
+    res.json({ enabled: true, summary });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS agent summary failed', message: msg });
+  }
+});
+
+app.post('/api/ens/capability/check', async (req: Request, res: Response) => {
+  const walletAddress = String(req.body?.walletAddress || '').trim();
+  const requiredSubname = String(req.body?.requiredSubname || '').trim();
+  if (!walletAddress || !isAddress(walletAddress)) {
+    res.status(400).json({ error: 'walletAddress must be a valid 0x EVM address' });
+    return;
+  }
+  if (!requiredSubname) {
+    res.status(400).json({ error: 'requiredSubname is required (e.g. tier1.customer.eth)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, capability: null });
+    return;
+  }
+  try {
+    const capability = await checkSubnameCapability({
+      requiredSubname,
+      walletAddress: walletAddress as Address,
+    });
+    res.json({ enabled: true, capability, authorized: capability.passes });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS subname capability check failed', message: msg });
+  }
+});
+
+app.post('/api/ens/capability/protected', async (req: Request, res: Response) => {
+  const walletAddress = String(req.body?.walletAddress || '').trim();
+  const requiredSubname = String(req.body?.requiredSubname || '').trim();
+  if (!walletAddress || !isAddress(walletAddress) || !requiredSubname) {
+    res.status(400).json({
+      error: 'walletAddress and requiredSubname are required',
+      example: { walletAddress: '0x...', requiredSubname: 'tier1.customer.eth' },
+    });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.status(503).json({ error: 'ENS capability gate is disabled (ENS_DISABLED=true)' });
+    return;
+  }
+  try {
+    const capability = await checkSubnameCapability({
+      walletAddress: walletAddress as Address,
+      requiredSubname,
+    });
+    if (!capability.passes) {
+      res.status(403).json({
+        error: 'Access denied: wallet lacks ENS subname capability',
+        capability,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      message: `Access granted for ${capability.requiredSubname}`,
+      capability,
+      scopedEntitlements: ['premium-research', 'high-rate-limit', 'agent-handoff'],
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS capability-protected route failed', message: msg });
+  }
 });
 
 app.get('/', (_req: Request, res: Response) => {
@@ -1373,6 +1549,9 @@ app.get('/api/registry', async (req: Request, res: Response) => {
   const category = req.query.category as string;
   const sortBy = (req.query.sort as string) || 'efficiency';
   const minReputation = parseInt(req.query.minRep as string) || 0;
+  const includeEns =
+    String(req.query.includeEns || '').toLowerCase() === 'true' ||
+    String(req.query.ens || '').toLowerCase() === 'true';
 
   const onChainRegistry = await fetchOnChainRegistry(AGENT_REGISTRY_CONTRACT_ADDRESS);
 
@@ -1401,6 +1580,35 @@ app.get('/api/registry', async (req: Request, res: Response) => {
   const onChainCategories = onChainRegistry.agents.map(a => a.category);
   const categories = [...new Set([...offChainCategories, ...onChainCategories])];
 
+  let ensProfilesByAddress: Record<string, Awaited<ReturnType<typeof resolveAddressProfile>>> | null = null;
+  let onChainWithEns = onChainRegistry.agents as any[];
+  if (includeEns && ensResolutionEnabled()) {
+    const addresses = Array.from(
+      new Set(
+        [
+          ...agents.map(a => a.address),
+          ...onChainRegistry.agents.map(a => a.address),
+        ].filter(a => isAddress(a)),
+      ),
+    ) as Address[];
+    const enriched = await Promise.all(
+      addresses.map(async addr => {
+        const p = await resolveAddressProfile(addr);
+        return [addr.toLowerCase(), p] as const;
+      }),
+    );
+    ensProfilesByAddress = Object.fromEntries(enriched);
+    onChainWithEns = onChainRegistry.agents.map(a => {
+      const hit = ensProfilesByAddress?.[a.address.toLowerCase()];
+      return hit ? { ...a, ens: hit } : a;
+    });
+    agents = agents.map(a => {
+      if (!isAddress(a.address)) return a;
+      const hit = ensProfilesByAddress?.[a.address.toLowerCase()];
+      return hit ? { ...a, ens: hit } : a;
+    });
+  }
+
   res.json({
     agents,
     count: agents.length,
@@ -1414,7 +1622,16 @@ app.get('/api/registry', async (req: Request, res: Response) => {
     /** x402 / MPP settlement network id (Stellar) — distinct from the EVM registry chain above. */
     network: NETWORK,
     /** Live data from `AgentRegistry` (EVM) via RPC — indexed `AgentRegistered` + `getAgent`. */
-    onChain: onChainRegistry,
+    onChain: {
+      ...onChainRegistry,
+      agents: onChainWithEns,
+    },
+    ens: {
+      enabled: ensResolutionEnabled(),
+      included: includeEns && ensResolutionEnabled(),
+      recordsKey: 'com.lobbie.agent-v1',
+      addressesEnriched: ensProfilesByAddress ? Object.keys(ensProfilesByAddress).length : 0,
+    },
   });
 });
 
@@ -3487,6 +3704,9 @@ app.listen(PORT, HOST, () => {
   console.log(`║  AgentRegistry (EVM): ${AGENT_REGISTRY_CONTRACT_ADDRESS}`);
   console.log('║  Protocol    : x402 (MPP)');
   console.log(`║  Agents      : ${agentRegistry.length} registered`);
+  if (ensResolutionEnabled()) {
+    console.log('║  ENS (ETH L1): enabled — GET /api/ens/display | profile | agent');
+  }
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log('║  Paid Endpoints (Worker Agents):');
   Object.entries(PRICES).forEach(([id, p]) => {
@@ -3496,8 +3716,20 @@ app.listen(PORT, HOST, () => {
   console.log('║  Free Endpoints:');
   console.log('║    GET  /health       GET  /api/tools      GET  /api/registry');
   console.log('║    GET  /api/payments  GET  /api/stats      POST /api/agent/query');
+  console.log('║    GET  /api/ens/*    (identity: resolve + reverse + profile)');
   console.log('╚══════════════════════════════════════════════════════════════╝');
   console.log('');
+  void getConfiguredAgentEnsSummary()
+    .then(summary => {
+      if (summary && summary.addressesMatch === false) {
+        console.warn(
+          '[ENS] ENS_AGENT_NAME resolves to an address that does not match ZG_COMPUTE_PRIVATE_KEY / EVM_SETTLEMENT_PRIVATE_KEY.',
+        );
+      }
+    })
+    .catch(() => {
+      /* optional RPC unavailable */
+    });
 });
 
 export default app;

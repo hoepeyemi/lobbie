@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { createPublicClient, formatEther, http, isAddress, type Address } from 'viem';
 import { useAccount, useBalance } from 'wagmi';
 import { galileoTestnet } from '@/lib/wagmiConfig';
+import { API_URL } from '@/lib/api';
 
 const AGENT_PRIVATE_KEY = process.env.NEXT_PUBLIC_AGENT_PRIVATE_KEY || '';
 const SERVER_ADDRESS = (process.env.NEXT_PUBLIC_SERVER_ADDRESS || '').trim();
@@ -22,6 +23,25 @@ export default function WalletInfo() {
   const { address: connected } = useAccount();
   const { data: userBal } = useBalance({ address: connected });
   const [serverBalance, setServerBalance] = useState<string | null>(null);
+  const [userDisplay, setUserDisplay] = useState<string | null>(null);
+  const [serverDisplay, setServerDisplay] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!connected) {
+      setUserDisplay(null);
+      return;
+    }
+    const ac = async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/ens/display?address=${encodeURIComponent(connected)}`);
+        const j = (await r.json()) as { display?: string };
+        setUserDisplay(typeof j.display === 'string' ? j.display : null);
+      } catch {
+        setUserDisplay(null);
+      }
+    };
+    void ac();
+  }, [connected]);
 
   useEffect(() => {
     if (!SERVER_ADDRESS || !isAddress(SERVER_ADDRESS)) {
@@ -39,6 +59,23 @@ export default function WalletInfo() {
     void ac();
     const interval = setInterval(() => void ac(), 10_000);
     return () => clearInterval(interval);
+  }, [SERVER_ADDRESS]);
+
+  useEffect(() => {
+    if (!SERVER_ADDRESS || !isAddress(SERVER_ADDRESS)) {
+      setServerDisplay(null);
+      return;
+    }
+    const ac = async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/ens/display?address=${encodeURIComponent(SERVER_ADDRESS)}`);
+        const j = (await r.json()) as { display?: string };
+        setServerDisplay(typeof j.display === 'string' ? j.display : null);
+      } catch {
+        setServerDisplay(null);
+      }
+    };
+    void ac();
   }, [SERVER_ADDRESS]);
 
   return (
@@ -67,7 +104,7 @@ export default function WalletInfo() {
         }}>
           <div style={{ fontSize: '0.5rem', color: 'var(--text-muted)', marginBottom: 1 }}>Your wallet</div>
           <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-            {shortAddr(connected)}
+            {userDisplay || shortAddr(connected)}
             <span style={{ marginLeft: 6, color: 'var(--accent-primary)', fontWeight: 700 }}>
               {userBal ? `${parseFloat(userBal.formatted).toFixed(4)} ${userBal.symbol}` : '…'}
             </span>
@@ -83,7 +120,7 @@ export default function WalletInfo() {
         }}>
           <div style={{ fontSize: '0.5rem', color: 'var(--text-muted)', marginBottom: 1 }}>Server (EVM)</div>
           <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-            {shortAddr(SERVER_ADDRESS)}
+            {serverDisplay || shortAddr(SERVER_ADDRESS)}
             <span style={{ marginLeft: 6, color: 'var(--accent-primary)', fontWeight: 700 }}>
               {serverBalance != null && serverBalance !== '—' ? `${parseFloat(serverBalance).toFixed(4)} 0G` : (serverBalance ?? '...')}
             </span>
