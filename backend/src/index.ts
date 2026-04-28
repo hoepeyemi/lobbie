@@ -29,7 +29,7 @@
  *   GET  /api/stats             — Economy statistics
  *   GET  /api/agent/events      — SSE stream
  *   POST /api/agent/query       — Agent orchestration entry
- *   GET  /api/ens/*             — ENS (Ethereum L1): display name, profile, agent binding
+ *   GET  /api/ens/*             — ENS: display name, profile, agent binding, verifiable hooks
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -38,7 +38,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { Mppx, stellar, Store } from '@stellar/mpp/charge/server';
 import { XLM_SAC_TESTNET as TOKEN_SAC_TESTNET, HORIZON_URLS } from '@stellar/mpp';
 import { Keypair } from '@stellar/stellar-sdk';
@@ -51,8 +51,10 @@ import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
 import { createWalletClient, http, isAddress, parseEther, recoverMessageAddress, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  checkEnsAdminAccess,
   checkSubnameCapability,
   ensResolutionEnabled,
+  getEnsTextRecord,
   resolveAddressProfile,
   forwardResolveEnsName,
   reverseResolveAddress,
@@ -140,6 +142,14 @@ const ENS_CAPABILITY_CHALLENGE_TTL_MS = Math.max(
   Number.parseInt(process.env.ENS_CAPABILITY_CHALLENGE_TTL_MS || '300000', 10) || 300_000,
 );
 const ENS_RESEARCH_REQUIRED_SUBNAME = (process.env.ENS_RESEARCH_REQUIRED_SUBNAME || '').trim();
+const ENS_ADMIN_NAME = (process.env.ENS_ADMIN_NAME || '').trim();
+const ENS_ADMIN_ALLOWLIST_TEXT_KEY = (process.env.ENS_ADMIN_ALLOWLIST_TEXT_KEY || 'com.lobbie.allowlist').trim();
+const ENS_ADMIN_CHALLENGE_TTL_MS = Math.max(
+  30_000,
+  Number.parseInt(process.env.ENS_ADMIN_CHALLENGE_TTL_MS || String(ENS_CAPABILITY_CHALLENGE_TTL_MS), 10) ||
+    ENS_CAPABILITY_CHALLENGE_TTL_MS,
+);
+const ENS_VERIFY_HOOK_STRICT_DEFAULT = process.env.ENS_VERIFY_HOOK_STRICT_DEFAULT !== 'false';
 const ENS_INTERNAL_SIGNER_PRIVATE_KEY = parseEvmPrivateKey(
   process.env.ENS_INTERNAL_SIGNER_PRIVATE_KEY ||
     process.env.EVM_SETTLEMENT_PRIVATE_KEY ||
@@ -159,6 +169,18 @@ type EnsCapabilityChallenge = {
 };
 
 const ensCapabilityChallenges = new Map<string, EnsCapabilityChallenge>();
+
+type EnsAdminChallenge = {
+  nonce: string;
+  walletAddress: Address;
+  adminName: string;
+  message: string;
+  issuedAtIso: string;
+  expiresAtMs: number;
+  used: boolean;
+};
+
+const ensAdminChallenges = new Map<string, EnsAdminChallenge>();
 
 function newChallengeNonce(): string {
   return randomBytes(16).toString('hex');
@@ -191,6 +213,31 @@ function gcEnsChallenges(): void {
   for (const [k, v] of ensCapabilityChallenges) {
     if (v.expiresAtMs <= now || v.used) ensCapabilityChallenges.delete(k);
   }
+  for (const [k, v] of ensAdminChallenges) {
+    if (v.expiresAtMs <= now || v.used) ensAdminChallenges.delete(k);
+  }
+}
+
+function buildEnsAdminMessage(input: {
+  walletAddress: Address;
+  adminName: string;
+  nonce: string;
+  issuedAtIso: string;
+  expiresAtIso: string;
+}): string {
+  return [
+    `${HOST}:${PORT} wants you to sign in with your Ethereum account:`,
+    input.walletAddress,
+    '',
+    `ENS Admin Authorization for ${input.adminName}`,
+    '',
+    `URI: http://${HOST}:${PORT}/api/admin`,
+    'Version: 1',
+    `Chain ID: ${CHAIN_ID}`,
+    `Nonce: ${input.nonce}`,
+    `Issued At: ${input.issuedAtIso}`,
+    `Expiration Time: ${input.expiresAtIso}`,
+  ].join('\n');
 }
 
 function getCapabilityAuthInput(req: Request): {
@@ -298,6 +345,111 @@ function createEnsCapabilityGuard(requiredSubnameFromEnv: string) {
       return;
     }
     (req as any).ensCapability = verdict.capability;
+    next();
+  };
+}
+
+function getAdminAuthInput(req: Request): {
+  walletAddress: string;
+  challengeNonce: string;
+  signature: string;
+} {
+  const body = req.body || {};
+  const walletAddress = String(
+    body.walletAddress || req.header('x-wallet-address') || req.header('x-ens-wallet-address') || '',
+  ).trim();
+  const challengeNonce = String(
+    body.challengeNonce || req.header('x-ens-admin-nonce') || req.header('x-ens-capability-nonce') || '',
+  ).trim();
+  const signature = String(
+    body.signature || req.header('x-ens-admin-signature') || req.header('x-ens-capability-signature') || '',
+  ).trim();
+  return { walletAddress, challengeNonce, signature };
+}
+
+async function authorizeEnsAdminRequest(input: {
+  walletAddress: string;
+  challengeNonce: string;
+  signature: string;
+  adminName: string;
+}): Promise<
+  | { ok: true; access: Awaited<ReturnType<typeof checkEnsAdminAccess>> }
+  | { ok: false; status: number; error: string }
+> {
+  const { walletAddress, challengeNonce, signature, adminName } = input;
+  if (!walletAddress || !isAddress(walletAddress) || !challengeNonce || !signature) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'walletAddress, challengeNonce, and signature are required',
+    };
+  }
+  if (!ensResolutionEnabled()) {
+    return { ok: false, status: 503, error: 'ENS admin auth is disabled (ENS_DISABLED=true)' };
+  }
+
+  gcEnsChallenges();
+  const challenge = ensAdminChallenges.get(challengeNonce);
+  if (!challenge) return { ok: false, status: 401, error: 'Invalid or expired ENS admin challenge nonce' };
+  if (challenge.used || challenge.expiresAtMs <= Date.now()) {
+    ensAdminChallenges.delete(challengeNonce);
+    return { ok: false, status: 401, error: 'ENS admin challenge has expired or was already used' };
+  }
+  if (
+    challenge.walletAddress.toLowerCase() !== walletAddress.toLowerCase() ||
+    challenge.adminName.toLowerCase() !== adminName.toLowerCase()
+  ) {
+    return { ok: false, status: 401, error: 'Challenge does not match walletAddress/adminName' };
+  }
+
+  let recovered: Address;
+  try {
+    recovered = await recoverMessageAddress({
+      message: challenge.message,
+      signature: signature as `0x${string}`,
+    });
+  } catch {
+    return { ok: false, status: 401, error: 'Invalid signature format or recover failed' };
+  }
+  if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
+    return { ok: false, status: 401, error: 'Signature does not match walletAddress' };
+  }
+  challenge.used = true;
+  ensAdminChallenges.set(challengeNonce, challenge);
+
+  const access = await checkEnsAdminAccess({
+    walletAddress: walletAddress as Address,
+    adminName,
+    allowlistTextKey: ENS_ADMIN_ALLOWLIST_TEXT_KEY,
+  });
+  if (!access.passes) {
+    return { ok: false, status: 403, error: 'Access denied: wallet is not authorized by ENS admin rules' };
+  }
+  return { ok: true, access };
+}
+
+function createEnsAdminGuard(adminNameFromEnv: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const adminName = adminNameFromEnv.trim();
+    if (!adminName) {
+      next();
+      return;
+    }
+    const auth = getAdminAuthInput(req);
+    const verdict = await authorizeEnsAdminRequest({
+      ...auth,
+      adminName,
+    });
+    if (!verdict.ok) {
+      res.status(verdict.status).json({
+        error: verdict.error,
+        adminName,
+        allowlistTextKey: ENS_ADMIN_ALLOWLIST_TEXT_KEY,
+        hint: 'Call /api/ens/admin/challenge, sign challenge.message, then send walletAddress/challengeNonce/signature',
+      });
+      return;
+    }
+    (req as any).ensAdminAccess = verdict.access;
     next();
   };
 }
@@ -1554,6 +1706,200 @@ app.get('/api/ens/profile', async (req: Request, res: Response) => {
   }
 });
 
+function decodeBase64UrlUtf8(input: string): string {
+  const s = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = s + '='.repeat((4 - (s.length % 4 || 4)) % 4);
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function normalizeHashCandidates(anchorRaw: string, hashAlg: string): Set<string> {
+  const out = new Set<string>();
+  const tokens = anchorRaw
+    .split(/[,\s|]+/)
+    .map(t => t.trim())
+    .filter(Boolean);
+  for (const t0 of tokens) {
+    let t = t0.toLowerCase();
+    if (t.startsWith(`${hashAlg}:`)) t = t.slice(hashAlg.length + 1);
+    if (/^0x[0-9a-f]{64}$/.test(t)) {
+      out.add(t);
+      out.add(t.slice(2));
+      continue;
+    }
+    if (/^[0-9a-f]{64}$/.test(t)) {
+      out.add(`0x${t}`);
+      out.add(t);
+    }
+  }
+  return out;
+}
+
+app.get('/api/ens/verifiable-hooks', async (req: Request, res: Response) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'Query "name" is required (e.g. myagent.eth)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, name, hooks: null });
+    return;
+  }
+  if (!normalizeEnsName(name)) {
+    res.status(400).json({ error: 'Invalid or non-ENS name' });
+    return;
+  }
+  try {
+    const [vcJwtRef, attestationHash] = await Promise.all([
+      getEnsTextRecord(name, 'vnd.lobbie.vc-jwt'),
+      getEnsTextRecord(name, 'vnd.lobbie.attestation-hash'),
+    ]);
+    res.json({
+      enabled: true,
+      name: normalizeEnsName(name),
+      hooks: {
+        vcJwtRef: vcJwtRef || null,
+        attestationHash: attestationHash || null,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS verifiable hooks fetch failed', message: msg });
+  }
+});
+
+async function verifyEnsHookFromBody(body: Record<string, unknown>): Promise<{ status: number; json: Record<string, unknown> }> {
+  const name = String(body?.name || '').trim();
+  const hookKey = String(body?.hookKey || '').trim();
+  const content = typeof body?.content === 'string' ? body.content : '';
+  const contentUrl = String(body?.contentUrl || '').trim();
+  const hashAlg = String(body?.hashAlg || 'sha256').trim().toLowerCase();
+  const strict =
+    typeof body?.strict === 'boolean'
+      ? body.strict
+      : String(body?.strict || '').toLowerCase() === 'true'
+        ? true
+        : String(body?.strict || '').toLowerCase() === 'false'
+          ? false
+          : ENS_VERIFY_HOOK_STRICT_DEFAULT;
+  if (!name || !hookKey) {
+    return { status: 400, json: { error: 'name and hookKey are required' } };
+  }
+  if (!['vnd.lobbie.vc-jwt', 'vnd.lobbie.attestation-hash'].includes(hookKey)) {
+    return {
+      status: 400,
+      json: { error: 'hookKey must be vnd.lobbie.vc-jwt or vnd.lobbie.attestation-hash' },
+    };
+  }
+  if (!content && !contentUrl) {
+    return { status: 400, json: { error: 'content or contentUrl is required for verification' } };
+  }
+  if (!ensResolutionEnabled()) {
+    return { status: 200, json: { enabled: false, verified: false } };
+  }
+  if (!normalizeEnsName(name)) {
+    return { status: 400, json: { error: 'Invalid or non-ENS name' } };
+  }
+  if (!['sha256', 'keccak256'].includes(hashAlg)) {
+    return { status: 400, json: { error: 'hashAlg must be sha256 or keccak256' } };
+  }
+  try {
+    const anchor = (await getEnsTextRecord(name, hookKey)) || '';
+    if (!anchor) {
+      return {
+        status: 404,
+        json: { error: `No ENS text record found for ${hookKey}`, verified: false },
+      };
+    }
+    let payload = content;
+    if (!payload && contentUrl) {
+      const fetched = await axios.get(contentUrl, { timeout: 12_000, responseType: 'text' });
+      payload = typeof fetched.data === 'string' ? fetched.data : JSON.stringify(fetched.data);
+    }
+    const digest = createHash(hashAlg).update(payload, 'utf8').digest('hex');
+    const digestHex = `0x${digest}`;
+    const normalizedAnchor = anchor.trim();
+    const candidates = normalizeHashCandidates(normalizedAnchor, hashAlg);
+    const directExact = candidates.has(digestHex.toLowerCase()) || candidates.has(digest.toLowerCase());
+    const fallbackContains = normalizedAnchor.toLowerCase().includes(digestHex.toLowerCase());
+
+    let jwtVerification: Record<string, unknown> | null = null;
+    if (hookKey === 'vnd.lobbie.vc-jwt') {
+      const jwt = payload.trim();
+      const parts = jwt.split('.');
+      let parsedHeader: Record<string, unknown> | null = null;
+      let parsedPayload: Record<string, unknown> | null = null;
+      let jwtFormatValid = false;
+      let jwtError: string | null = null;
+      let payloadHashHex: string | null = null;
+      let payloadHashMatchesAttestation = false;
+      if (parts.length === 3) {
+        try {
+          parsedHeader = JSON.parse(decodeBase64UrlUtf8(parts[0])) as Record<string, unknown>;
+          parsedPayload = JSON.parse(decodeBase64UrlUtf8(parts[1])) as Record<string, unknown>;
+          jwtFormatValid = true;
+          payloadHashHex = `0x${createHash(hashAlg).update(decodeBase64UrlUtf8(parts[1]), 'utf8').digest('hex')}`;
+          const attestationAnchor = (await getEnsTextRecord(name, 'vnd.lobbie.attestation-hash')) || '';
+          const attestationCandidates = normalizeHashCandidates(attestationAnchor, hashAlg);
+          payloadHashMatchesAttestation = attestationCandidates.has(payloadHashHex.toLowerCase());
+        } catch (err) {
+          jwtError = err instanceof Error ? err.message : String(err);
+        }
+      } else {
+        jwtError = 'JWT must contain exactly 3 dot-separated segments';
+      }
+      let expired: boolean | null = null;
+      if (parsedPayload && typeof parsedPayload.exp === 'number') {
+        expired = Date.now() / 1000 > parsedPayload.exp;
+      }
+      jwtVerification = {
+        formatValid: jwtFormatValid,
+        error: jwtError,
+        header: parsedHeader,
+        payload: parsedPayload,
+        expired,
+        payloadHashHex,
+        payloadHashMatchesAttestation,
+      };
+    }
+
+    const verified = strict ? directExact : directExact || fallbackContains;
+    return {
+      status: 200,
+      json: {
+        enabled: true,
+        verified,
+        name: normalizeEnsName(name),
+        hookKey,
+        hashAlg,
+        strictMode: strict,
+        computedHash: digestHex,
+        ensAnchor: anchor,
+        anchorCandidates: [...candidates],
+        matchMode: directExact ? 'exact' : fallbackContains ? 'contains-fallback' : 'none',
+        canonicalTrustAnchor: `${normalizeEnsName(name)}:${hookKey}`,
+        source: contentUrl || 'inline-content',
+        jwtVerification,
+      },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: 500, json: { error: 'ENS verifiable hook check failed', message: msg, verified: false } };
+  }
+}
+
+app.post('/api/ens/verify-hook', async (req: Request, res: Response) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+  const out = await verifyEnsHookFromBody(body);
+  res.status(out.status).json(out.json);
+});
+
+/** Same as POST /api/ens/verify-hook with hookKey fixed to vnd.lobbie.vc-jwt */
+app.post('/api/ens/verify-vc-jwt', async (req: Request, res: Response) => {
+  const base = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+  const out = await verifyEnsHookFromBody({ ...base, hookKey: 'vnd.lobbie.vc-jwt' });
+  res.status(out.status).json(out.json);
+});
+
 app.get('/api/ens/forward', async (req: Request, res: Response) => {
   const name = String(req.query.name || '').trim();
   if (!name) {
@@ -1671,6 +2017,83 @@ app.post('/api/ens/capability/challenge', async (req: Request, res: Response) =>
       issuedAt: challenge.issuedAtIso,
       expiresAt: expiresAtIso,
       ttlMs: ENS_CAPABILITY_CHALLENGE_TTL_MS,
+    },
+  });
+});
+
+app.post('/api/ens/admin/check', async (req: Request, res: Response) => {
+  const walletAddress = String(req.body?.walletAddress || '').trim();
+  const adminName = String(req.body?.adminName || ENS_ADMIN_NAME || '').trim();
+  if (!walletAddress || !isAddress(walletAddress)) {
+    res.status(400).json({ error: 'walletAddress must be a valid 0x EVM address' });
+    return;
+  }
+  if (!adminName) {
+    res.status(400).json({ error: 'adminName is required (or set ENS_ADMIN_NAME env)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, authorized: false, access: null });
+    return;
+  }
+  try {
+    const access = await checkEnsAdminAccess({
+      adminName,
+      walletAddress: walletAddress as Address,
+      allowlistTextKey: ENS_ADMIN_ALLOWLIST_TEXT_KEY,
+    });
+    res.json({ enabled: true, authorized: access.passes, access });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS admin check failed', message: msg });
+  }
+});
+
+app.post('/api/ens/admin/challenge', async (req: Request, res: Response) => {
+  const walletAddress = String(req.body?.walletAddress || '').trim();
+  const adminName = String(req.body?.adminName || ENS_ADMIN_NAME || '').trim();
+  if (!walletAddress || !isAddress(walletAddress)) {
+    res.status(400).json({ error: 'walletAddress must be a valid 0x EVM address' });
+    return;
+  }
+  if (!adminName) {
+    res.status(400).json({ error: 'adminName is required (or set ENS_ADMIN_NAME env)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.status(503).json({ error: 'ENS admin auth is disabled (ENS_DISABLED=true)' });
+    return;
+  }
+  gcEnsChallenges();
+  const nonce = newChallengeNonce();
+  const issuedAtIso = new Date().toISOString();
+  const expiresAtMs = Date.now() + ENS_ADMIN_CHALLENGE_TTL_MS;
+  const expiresAtIso = new Date(expiresAtMs).toISOString();
+  const normalizedAdminName = normalizeEnsName(adminName) || adminName;
+  const challenge: EnsAdminChallenge = {
+    nonce,
+    walletAddress: walletAddress as Address,
+    adminName: normalizedAdminName,
+    message: buildEnsAdminMessage({
+      walletAddress: walletAddress as Address,
+      adminName: normalizedAdminName,
+      nonce,
+      issuedAtIso,
+      expiresAtIso,
+    }),
+    issuedAtIso,
+    expiresAtMs,
+    used: false,
+  };
+  ensAdminChallenges.set(nonce, challenge);
+  res.json({
+    ok: true,
+    challenge: {
+      nonce,
+      message: challenge.message,
+      issuedAt: challenge.issuedAtIso,
+      expiresAt: expiresAtIso,
+      ttlMs: ENS_ADMIN_CHALLENGE_TTL_MS,
     },
   });
 });
@@ -1999,7 +2422,7 @@ app.get('/api/0g/swarm/shared-root', async (_req: Request, res: Response) => {
   }
 });
 
-app.post('/api/0g/swarm/shared-root', async (req: Request, res: Response) => {
+app.post('/api/0g/swarm/shared-root', createEnsAdminGuard(ENS_ADMIN_NAME), async (req: Request, res: Response) => {
   try {
     const rootHash = String(req.body?.rootHash || '').trim();
     const syncNow = typeof req.body?.syncNow === 'boolean' ? req.body.syncNow : true;
@@ -2056,7 +2479,7 @@ app.get('/api/0g/account', async (_req: Request, res: Response) => {
   }
 });
 
-app.post('/api/0g/account/deposit', async (req: Request, res: Response) => {
+app.post('/api/0g/account/deposit', createEnsAdminGuard(ENS_ADMIN_NAME), async (req: Request, res: Response) => {
   try {
     const amount = Number(req.body?.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -2071,7 +2494,7 @@ app.post('/api/0g/account/deposit', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/0g/account/transfer', async (req: Request, res: Response) => {
+app.post('/api/0g/account/transfer', createEnsAdminGuard(ENS_ADMIN_NAME), async (req: Request, res: Response) => {
   try {
     const providerAddress = String(req.body?.providerAddress || '').trim();
     const amount = String(req.body?.amount || '').trim();
@@ -2087,7 +2510,7 @@ app.post('/api/0g/account/transfer', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/0g/account/bootstrap', async (_req: Request, res: Response) => {
+app.post('/api/0g/account/bootstrap', createEnsAdminGuard(ENS_ADMIN_NAME), async (_req: Request, res: Response) => {
   try {
     const out = await bootstrapComputeAccount();
     res.json(out);

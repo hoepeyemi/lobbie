@@ -172,6 +172,8 @@ export const ENS_AGENT_TEXT_KEYS = [
   'url',
   'avatar',
   'com.lobbie.agent-v1',
+  'vnd.lobbie.vc-jwt',
+  'vnd.lobbie.attestation-hash',
 ] as const;
 
 export type EnsAgentProfile = {
@@ -179,6 +181,10 @@ export type EnsAgentProfile = {
   resolvedAddress: Address | null;
   text: Partial<Record<(typeof ENS_AGENT_TEXT_KEYS)[number], string>>;
   lobbieAgentJson: Record<string, unknown> | null;
+  verifiableHooks: {
+    vcJwtRef: string | null;
+    attestationHash: string | null;
+  };
 };
 
 export type ResolvedAddressProfile = {
@@ -233,6 +239,10 @@ export async function fetchEnsAgentProfile(nameInput: string): Promise<EnsAgentP
     resolvedAddress,
     text,
     lobbieAgentJson,
+    verifiableHooks: {
+      vcJwtRef: text['vnd.lobbie.vc-jwt'] || null,
+      attestationHash: text['vnd.lobbie.attestation-hash'] || null,
+    },
   };
   cacheSet(ck, profile, ensCacheTtlMs());
   return profile;
@@ -249,7 +259,7 @@ export async function resolveAddressProfile(address: Address): Promise<ResolvedA
   };
 }
 
-async function getEnsNameOwner(nameInput: string): Promise<Address | null> {
+export async function getEnsNameOwner(nameInput: string): Promise<Address | null> {
   if (!ensResolutionEnabled()) return null;
   const name = normalizeEnsName(nameInput);
   if (!name) return null;
@@ -272,6 +282,23 @@ async function getEnsNameOwner(nameInput: string): Promise<Address | null> {
   }
   cacheSet(ck, owner, ensCacheTtlMs());
   return owner;
+}
+
+export async function getEnsTextRecord(nameInput: string, key: string): Promise<string | null> {
+  if (!ensResolutionEnabled()) return null;
+  const name = normalizeEnsName(nameInput);
+  if (!name || !key.trim()) return null;
+  const cacheKey = `text:${name}:${key}`;
+  const hit = cacheGet<string | null>(cacheKey);
+  if (hit !== undefined) return hit;
+  let value: string | null = null;
+  try {
+    value = await getEnsEthClient().getEnsText({ name, key: key.trim() });
+  } catch {
+    value = null;
+  }
+  cacheSet(cacheKey, value, ensCacheTtlMs());
+  return value;
 }
 
 export type SubnameCapabilityCheck = {
@@ -347,6 +374,138 @@ export type ConfiguredAgentEnsSummary = {
   addressesMatch: boolean | null;
   profile: EnsAgentProfile | null;
 };
+
+export type EnsAdminAccessCheck = {
+  adminName: string;
+  walletAddress: Address;
+  ownerAddress: Address | null;
+  resolvedAddress: Address | null;
+  allowlistTextKey: string;
+  allowlistValue: string | null;
+  allowlistAddresses: Address[];
+  passes: boolean;
+  reason:
+    | 'owner-match'
+    | 'resolver-match'
+    | 'allowlist-match'
+    | 'allowlist-merkle-unsupported'
+    | 'no-match'
+    | 'invalid-admin-name';
+};
+
+export async function checkEnsAdminAccess(input: {
+  adminName: string;
+  walletAddress: Address;
+  allowlistTextKey?: string;
+}): Promise<EnsAdminAccessCheck> {
+  const normalizedName = normalizeEnsName(input.adminName);
+  const key = (input.allowlistTextKey || 'com.lobbie.allowlist').trim();
+  if (!normalizedName) {
+    return {
+      adminName: input.adminName,
+      walletAddress: input.walletAddress,
+      ownerAddress: null,
+      resolvedAddress: null,
+      allowlistTextKey: key,
+      allowlistValue: null,
+      allowlistAddresses: [],
+      passes: false,
+      reason: 'invalid-admin-name',
+    };
+  }
+
+  const [ownerAddress, resolvedAddress, allowlistValue] = await Promise.all([
+    getEnsNameOwner(normalizedName),
+    forwardResolveEnsName(normalizedName),
+    getEnsTextRecord(normalizedName, key),
+  ]);
+
+  const walletLower = input.walletAddress.toLowerCase();
+  if (ownerAddress && ownerAddress.toLowerCase() === walletLower) {
+    return {
+      adminName: normalizedName,
+      walletAddress: input.walletAddress,
+      ownerAddress,
+      resolvedAddress,
+      allowlistTextKey: key,
+      allowlistValue,
+      allowlistAddresses: [],
+      passes: true,
+      reason: 'owner-match',
+    };
+  }
+  if (resolvedAddress && resolvedAddress.toLowerCase() === walletLower) {
+    return {
+      adminName: normalizedName,
+      walletAddress: input.walletAddress,
+      ownerAddress,
+      resolvedAddress,
+      allowlistTextKey: key,
+      allowlistValue,
+      allowlistAddresses: [],
+      passes: true,
+      reason: 'resolver-match',
+    };
+  }
+
+  const raw = (allowlistValue || '').trim();
+  if (raw) {
+    if (/^(merkle:)?0x[0-9a-fA-F]{64}$/.test(raw)) {
+      return {
+        adminName: normalizedName,
+        walletAddress: input.walletAddress,
+        ownerAddress,
+        resolvedAddress,
+        allowlistTextKey: key,
+        allowlistValue,
+        allowlistAddresses: [],
+        passes: false,
+        reason: 'allowlist-merkle-unsupported',
+      };
+    }
+    const allowlistAddresses = raw
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .filter((a): a is Address => isAddress(a));
+    if (allowlistAddresses.some(a => a.toLowerCase() === walletLower)) {
+      return {
+        adminName: normalizedName,
+        walletAddress: input.walletAddress,
+        ownerAddress,
+        resolvedAddress,
+        allowlistTextKey: key,
+        allowlistValue,
+        allowlistAddresses,
+        passes: true,
+        reason: 'allowlist-match',
+      };
+    }
+    return {
+      adminName: normalizedName,
+      walletAddress: input.walletAddress,
+      ownerAddress,
+      resolvedAddress,
+      allowlistTextKey: key,
+      allowlistValue,
+      allowlistAddresses,
+      passes: false,
+      reason: 'no-match',
+    };
+  }
+
+  return {
+    adminName: normalizedName,
+    walletAddress: input.walletAddress,
+    ownerAddress,
+    resolvedAddress,
+    allowlistTextKey: key,
+    allowlistValue,
+    allowlistAddresses: [],
+    passes: false,
+    reason: 'no-match',
+  };
+}
 
 /** When `ENS_AGENT_NAME` is set: resolve forward + profile + compare with env-derived wallet. */
 export async function getConfiguredAgentEnsSummary(): Promise<ConfiguredAgentEnsSummary | null> {
