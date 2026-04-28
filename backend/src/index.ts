@@ -38,6 +38,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
+import { randomBytes } from 'node:crypto';
 import { Mppx, stellar, Store } from '@stellar/mpp/charge/server';
 import { XLM_SAC_TESTNET as TOKEN_SAC_TESTNET, HORIZON_URLS } from '@stellar/mpp';
 import { Keypair } from '@stellar/stellar-sdk';
@@ -47,7 +48,7 @@ import axios from 'axios';
 import { EXTERNAL_AGENTS, callExternalAgent } from './universal-adapter.js';
 import { fetchOnChainRegistry } from './evm/onChainRegistry.js';
 import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
-import { createWalletClient, http, isAddress, parseEther, type Address } from 'viem';
+import { createWalletClient, http, isAddress, parseEther, recoverMessageAddress, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   checkSubnameCapability,
@@ -134,6 +135,172 @@ const EVM_SETTLEMENT_PRIVATE_KEY = parseEvmPrivateKey(
 const EVM_SETTLEMENT_RECIPIENT = (process.env.EVM_SETTLEMENT_RECIPIENT || '').trim();
 const HAS_VALID_EVM_SETTLEMENT_RECIPIENT = Boolean(EVM_SETTLEMENT_RECIPIENT && isAddress(EVM_SETTLEMENT_RECIPIENT));
 const ZG_SWARM_DEFAULT = process.env.ZG_SWARM_DEFAULT === 'true';
+const ENS_CAPABILITY_CHALLENGE_TTL_MS = Math.max(
+  30_000,
+  Number.parseInt(process.env.ENS_CAPABILITY_CHALLENGE_TTL_MS || '300000', 10) || 300_000,
+);
+const ENS_RESEARCH_REQUIRED_SUBNAME = (process.env.ENS_RESEARCH_REQUIRED_SUBNAME || '').trim();
+const ENS_INTERNAL_SIGNER_PRIVATE_KEY = parseEvmPrivateKey(
+  process.env.ENS_INTERNAL_SIGNER_PRIVATE_KEY ||
+    process.env.EVM_SETTLEMENT_PRIVATE_KEY ||
+    process.env.ZG_COMPUTE_PRIVATE_KEY ||
+    process.env.AGENT_EVM_PRIVATE_KEY ||
+    process.env.AGENT_PRIVATE_KEY,
+);
+
+type EnsCapabilityChallenge = {
+  nonce: string;
+  walletAddress: Address;
+  requiredSubname: string;
+  message: string;
+  issuedAtIso: string;
+  expiresAtMs: number;
+  used: boolean;
+};
+
+const ensCapabilityChallenges = new Map<string, EnsCapabilityChallenge>();
+
+function newChallengeNonce(): string {
+  return randomBytes(16).toString('hex');
+}
+
+function buildEnsCapabilityMessage(input: {
+  walletAddress: Address;
+  requiredSubname: string;
+  nonce: string;
+  issuedAtIso: string;
+  expiresAtIso: string;
+}): string {
+  return [
+    `${HOST}:${PORT} wants you to sign in with your Ethereum account:`,
+    input.walletAddress,
+    '',
+    `ENS Capability Authorization for ${input.requiredSubname}`,
+    '',
+    `URI: http://${HOST}:${PORT}/api/ens/capability/protected`,
+    'Version: 1',
+    `Chain ID: ${CHAIN_ID}`,
+    `Nonce: ${input.nonce}`,
+    `Issued At: ${input.issuedAtIso}`,
+    `Expiration Time: ${input.expiresAtIso}`,
+  ].join('\n');
+}
+
+function gcEnsChallenges(): void {
+  const now = Date.now();
+  for (const [k, v] of ensCapabilityChallenges) {
+    if (v.expiresAtMs <= now || v.used) ensCapabilityChallenges.delete(k);
+  }
+}
+
+function getCapabilityAuthInput(req: Request): {
+  walletAddress: string;
+  requiredSubname: string;
+  challengeNonce: string;
+  signature: string;
+} {
+  const body = req.body || {};
+  const walletAddress = String(
+    body.walletAddress || req.header('x-wallet-address') || req.header('x-ens-wallet-address') || '',
+  ).trim();
+  const requiredSubname = String(
+    body.requiredSubname || req.header('x-ens-required-subname') || '',
+  ).trim();
+  const challengeNonce = String(
+    body.challengeNonce || req.header('x-ens-capability-nonce') || '',
+  ).trim();
+  const signature = String(
+    body.signature || req.header('x-ens-capability-signature') || '',
+  ).trim();
+  return { walletAddress, requiredSubname, challengeNonce, signature };
+}
+
+async function authorizeEnsCapabilityRequest(input: {
+  walletAddress: string;
+  requiredSubname: string;
+  challengeNonce: string;
+  signature: string;
+}): Promise<
+  | { ok: true; capability: Awaited<ReturnType<typeof checkSubnameCapability>> }
+  | { ok: false; status: number; error: string }
+> {
+  const { walletAddress, requiredSubname, challengeNonce, signature } = input;
+  if (!walletAddress || !isAddress(walletAddress) || !requiredSubname || !challengeNonce || !signature) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'walletAddress, requiredSubname, challengeNonce, and signature are required',
+    };
+  }
+  if (!ensResolutionEnabled()) {
+    return { ok: false, status: 503, error: 'ENS capability gate is disabled (ENS_DISABLED=true)' };
+  }
+
+  gcEnsChallenges();
+  const challenge = ensCapabilityChallenges.get(challengeNonce);
+  if (!challenge) return { ok: false, status: 401, error: 'Invalid or expired capability challenge nonce' };
+  if (challenge.used || challenge.expiresAtMs <= Date.now()) {
+    ensCapabilityChallenges.delete(challengeNonce);
+    return { ok: false, status: 401, error: 'Capability challenge has expired or was already used' };
+  }
+
+  const normalizedSubname = normalizeEnsName(requiredSubname) || requiredSubname.trim();
+  if (
+    challenge.walletAddress.toLowerCase() !== walletAddress.toLowerCase() ||
+    challenge.requiredSubname.toLowerCase() !== normalizedSubname.toLowerCase()
+  ) {
+    return { ok: false, status: 401, error: 'Challenge does not match walletAddress/requiredSubname' };
+  }
+
+  let recovered: Address;
+  try {
+    recovered = await recoverMessageAddress({
+      message: challenge.message,
+      signature: signature as `0x${string}`,
+    });
+  } catch {
+    return { ok: false, status: 401, error: 'Invalid signature format or recover failed' };
+  }
+  if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
+    return { ok: false, status: 401, error: 'Signature does not match walletAddress' };
+  }
+
+  challenge.used = true;
+  ensCapabilityChallenges.set(challengeNonce, challenge);
+
+  const capability = await checkSubnameCapability({
+    walletAddress: walletAddress as Address,
+    requiredSubname: normalizedSubname,
+  });
+  if (!capability.passes) {
+    return { ok: false, status: 403, error: 'Access denied: wallet lacks ENS subname capability' };
+  }
+  return { ok: true, capability };
+}
+
+function createEnsCapabilityGuard(requiredSubnameFromEnv: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const required = requiredSubnameFromEnv.trim();
+    if (!required) {
+      next();
+      return;
+    }
+    const auth = getCapabilityAuthInput(req);
+    // Route-level policy overrides user-supplied subname to prevent privilege escalation.
+    auth.requiredSubname = required;
+    const verdict = await authorizeEnsCapabilityRequest(auth);
+    if (!verdict.ok) {
+      res.status(verdict.status).json({
+        error: verdict.error,
+        requiredSubname: required,
+        hint: 'Call /api/ens/capability/challenge, sign challenge.message, then send walletAddress/challengeNonce/signature',
+      });
+      return;
+    }
+    (req as any).ensCapability = verdict.capability;
+    next();
+  };
+}
 
 let evmSettlementWarned = false;
 
@@ -394,13 +561,60 @@ async function callInternalPaidWorker(
   token: string,
   body: unknown,
 ): Promise<{ status: number; headers: globalThis.Headers; data: unknown }> {
+  const shouldAttachEnsCapability =
+    ensResolutionEnabled() &&
+    Boolean(ENS_RESEARCH_REQUIRED_SUBNAME) &&
+    endpoint.includes('/api/agent/research');
+
+  let outgoingBody: unknown = body;
+  if (
+    shouldAttachEnsCapability &&
+    outgoingBody &&
+    typeof outgoingBody === 'object' &&
+    !Array.isArray(outgoingBody)
+  ) {
+    const mutable = { ...(outgoingBody as Record<string, unknown>) };
+    const hasAuth =
+      typeof mutable.walletAddress === 'string' &&
+      typeof mutable.challengeNonce === 'string' &&
+      typeof mutable.signature === 'string';
+    if (!hasAuth && ENS_INTERNAL_SIGNER_PRIVATE_KEY) {
+      try {
+        const signer = privateKeyToAccount(ENS_INTERNAL_SIGNER_PRIVATE_KEY);
+        const challengeRes = await globalThis.fetch(`${internalWorkerHttpBase()}/api/ens/capability/challenge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            walletAddress: signer.address,
+            requiredSubname: ENS_RESEARCH_REQUIRED_SUBNAME,
+          }),
+        });
+        const challengeJson = (await challengeRes.json().catch(() => ({}))) as {
+          challenge?: { nonce?: string; message?: string };
+        };
+        const nonce = String(challengeJson?.challenge?.nonce || '').trim();
+        const message = String(challengeJson?.challenge?.message || '').trim();
+        if (challengeRes.ok && nonce && message) {
+          const signature = await signer.signMessage({ message });
+          mutable.walletAddress = signer.address;
+          mutable.requiredSubname = ENS_RESEARCH_REQUIRED_SUBNAME;
+          mutable.challengeNonce = nonce;
+          mutable.signature = signature;
+        }
+      } catch {
+        // If challenge/sign fails, keep original body; route will return a descriptive auth error.
+      }
+    }
+    outgoingBody = mutable;
+  }
+
   const base = internalWorkerHttpBase();
   const path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const url = `${base}${path}?token=${encodeURIComponent(token)}`;
   const res = await globalThis.fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body ?? {}),
+    body: JSON.stringify(outgoingBody ?? {}),
   });
   const ct = res.headers.get('content-type') || '';
   let data: unknown;
@@ -1412,32 +1626,81 @@ app.post('/api/ens/capability/check', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/ens/capability/protected', async (req: Request, res: Response) => {
+app.post('/api/ens/capability/challenge', async (req: Request, res: Response) => {
   const walletAddress = String(req.body?.walletAddress || '').trim();
   const requiredSubname = String(req.body?.requiredSubname || '').trim();
-  if (!walletAddress || !isAddress(walletAddress) || !requiredSubname) {
-    res.status(400).json({
-      error: 'walletAddress and requiredSubname are required',
-      example: { walletAddress: '0x...', requiredSubname: 'tier1.customer.eth' },
-    });
+  if (!walletAddress || !isAddress(walletAddress)) {
+    res.status(400).json({ error: 'walletAddress must be a valid 0x EVM address' });
+    return;
+  }
+  if (!requiredSubname) {
+    res.status(400).json({ error: 'requiredSubname is required (e.g. tier1.customer.eth)' });
     return;
   }
   if (!ensResolutionEnabled()) {
-    res.status(503).json({ error: 'ENS capability gate is disabled (ENS_DISABLED=true)' });
+    res.status(503).json({ error: 'ENS capability auth is disabled (ENS_DISABLED=true)' });
+    return;
+  }
+  gcEnsChallenges();
+  const nonce = newChallengeNonce();
+  const issuedAtIso = new Date().toISOString();
+  const expiresAtMs = Date.now() + ENS_CAPABILITY_CHALLENGE_TTL_MS;
+  const expiresAtIso = new Date(expiresAtMs).toISOString();
+  const normalizedSubname = normalizeEnsName(requiredSubname) || requiredSubname.trim();
+  const challenge: EnsCapabilityChallenge = {
+    nonce,
+    walletAddress: walletAddress as Address,
+    requiredSubname: normalizedSubname,
+    message: buildEnsCapabilityMessage({
+      walletAddress: walletAddress as Address,
+      requiredSubname: normalizedSubname,
+      nonce,
+      issuedAtIso,
+      expiresAtIso,
+    }),
+    issuedAtIso,
+    expiresAtMs,
+    used: false,
+  };
+  ensCapabilityChallenges.set(nonce, challenge);
+  res.json({
+    ok: true,
+    challenge: {
+      nonce,
+      message: challenge.message,
+      issuedAt: challenge.issuedAtIso,
+      expiresAt: expiresAtIso,
+      ttlMs: ENS_CAPABILITY_CHALLENGE_TTL_MS,
+    },
+  });
+});
+
+app.post('/api/ens/capability/protected', async (req: Request, res: Response) => {
+  const { walletAddress, requiredSubname, challengeNonce, signature } = getCapabilityAuthInput(req);
+  if (!walletAddress || !requiredSubname || !challengeNonce || !signature) {
+    res.status(400).json({
+      error: 'walletAddress, requiredSubname, challengeNonce, and signature are required',
+      example: {
+        walletAddress: '0x...',
+        requiredSubname: 'tier1.customer.eth',
+        challengeNonce: 'nonce from /api/ens/capability/challenge',
+        signature: '0x... personal_sign signature over challenge.message',
+      },
+    });
+    return;
+  }
+  const verdict = await authorizeEnsCapabilityRequest({
+    walletAddress,
+    requiredSubname,
+    challengeNonce,
+    signature,
+  });
+  if (!verdict.ok) {
+    res.status(verdict.status).json({ error: verdict.error });
     return;
   }
   try {
-    const capability = await checkSubnameCapability({
-      walletAddress: walletAddress as Address,
-      requiredSubname,
-    });
-    if (!capability.passes) {
-      res.status(403).json({
-        error: 'Access denied: wallet lacks ENS subname capability',
-        capability,
-      });
-      return;
-    }
+    const capability = verdict.capability;
     res.json({
       ok: true,
       message: `Access granted for ${capability.requiredSubname}`,
@@ -2124,7 +2387,11 @@ app.post('/api/agent/translate', createPaidRoute(PRICES.translate), async (req: 
 
 // ── Research Agent (hires Summarizer + Sentiment sub-agents) ───────────────
 
-app.post('/api/agent/research', createPaidRoute(PRICES.research), async (req: Request, res: Response) => {
+app.post(
+  '/api/agent/research',
+  createEnsCapabilityGuard(ENS_RESEARCH_REQUIRED_SUBNAME),
+  createPaidRoute(PRICES.research),
+  async (req: Request, res: Response) => {
   const token = resolveToken(req);
   const jobId = newAgentJobId();
   const out: Record<string, unknown> = { payment: null };

@@ -1,26 +1,37 @@
 /**
- * ENS resolution (Ethereum L1) for agent identity: forward + reverse + text records.
- * @see https://docs.ens.domains — always use a mainnet RPC; 0G agent keys are EVM addresses.
+ * ENS resolution for agent identity: forward + reverse + text records.
+ * @see https://docs.ens.domains
  */
 import { createPublicClient, http, isAddress, type Address, type PublicClient } from 'viem';
-import { mainnet } from 'viem/chains';
+import { mainnet, sepolia } from 'viem/chains';
 import { namehash, normalize } from 'viem/ens';
 import { privateKeyToAccount } from 'viem/accounts';
 
-const ENS_DISABLED = process.env.ENS_DISABLED === 'true';
-const ENS_ETH_RPC_URL =
-  process.env.ENS_ETH_RPC_URL?.trim() ||
-  process.env.ETH_MAINNET_RPC_URL?.trim() ||
-  'https://eth.llamarpc.com';
+function ensDisabled(): boolean {
+  return process.env.ENS_DISABLED === 'true';
+}
 
-const ENS_CACHE_TTL_MS = Math.max(
-  10_000,
-  Number.parseInt(process.env.ENS_CACHE_TTL_MS || '300000', 10) || 300_000,
-);
+function ensRpcUrl(): string {
+  return (
+    process.env.ENS_ETH_RPC_URL?.trim() ||
+    process.env.ETH_MAINNET_RPC_URL?.trim() ||
+    'https://eth.llamarpc.com'
+  );
+}
+
+function ensNetworkRaw(): string {
+  return (process.env.ENS_NETWORK || '').trim().toLowerCase();
+}
+
+function ensCacheTtlMs(): number {
+  return Math.max(10_000, Number.parseInt(process.env.ENS_CACHE_TTL_MS || '300000', 10) || 300_000);
+}
 
 /** Canonical agent name → forward-resolve and compare with compute/settlement wallet */
-const ENS_AGENT_NAME_RAW = process.env.ENS_AGENT_NAME?.trim();
-const ENS_REGISTRY_MAINNET = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e' as const;
+function ensAgentNameRaw(): string {
+  return process.env.ENS_AGENT_NAME?.trim() || '';
+}
+const ENS_REGISTRY_ADDRESS = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e' as const;
 const ensRegistryAbi = [
   {
     type: 'function',
@@ -45,17 +56,33 @@ function cacheSet<T>(key: string, value: T, ttlMs: number): void {
 }
 
 let ensClient: PublicClient | null = null;
+let ensClientKey = '';
+
+function getEnsChain() {
+  const ENS_NETWORK_RAW = ensNetworkRaw();
+  const ENS_ETH_RPC_URL = ensRpcUrl();
+  if (ENS_NETWORK_RAW === 'testnet') return sepolia;
+  if (ENS_NETWORK_RAW === 'sepolia') return sepolia;
+  if (ENS_NETWORK_RAW === 'mainnet') return mainnet;
+  // Auto-detect from RPC URL for convenience.
+  return ENS_ETH_RPC_URL.toLowerCase().includes('sepolia') ? sepolia : mainnet;
+}
 
 export function ensResolutionEnabled(): boolean {
-  return !ENS_DISABLED;
+  return !ensDisabled();
 }
 
 export function getEnsEthClient(): PublicClient {
-  if (!ensClient) {
+  const chain = getEnsChain();
+  const rpc = ensRpcUrl();
+  const key = `${chain.id}:${rpc}`;
+  if (!ensClient || ensClientKey !== key) {
+    const chain = getEnsChain();
     ensClient = createPublicClient({
-      chain: mainnet,
-      transport: http(ENS_ETH_RPC_URL),
+      chain,
+      transport: http(rpc),
     });
+    ensClientKey = key;
   }
   return ensClient;
 }
@@ -109,7 +136,7 @@ export async function forwardResolveEnsName(nameInput: string): Promise<Address 
   } catch {
     addr = null;
   }
-  cacheSet(ck, addr, ENS_CACHE_TTL_MS);
+  cacheSet(ck, addr, ensCacheTtlMs());
   return addr;
 }
 
@@ -136,7 +163,7 @@ export async function reverseResolveAddress(address: Address): Promise<ReverseEn
   } catch {
     ensName = null;
   }
-  cacheSet(ck, ensName, ENS_CACHE_TTL_MS);
+  cacheSet(ck, ensName, ensCacheTtlMs());
   return { ensName };
 }
 
@@ -207,7 +234,7 @@ export async function fetchEnsAgentProfile(nameInput: string): Promise<EnsAgentP
     text,
     lobbieAgentJson,
   };
-  cacheSet(ck, profile, ENS_CACHE_TTL_MS);
+  cacheSet(ck, profile, ensCacheTtlMs());
   return profile;
 }
 
@@ -234,7 +261,7 @@ async function getEnsNameOwner(nameInput: string): Promise<Address | null> {
   try {
     const node = namehash(name);
     const out = await getEnsEthClient().readContract({
-      address: ENS_REGISTRY_MAINNET,
+      address: ENS_REGISTRY_ADDRESS,
       abi: ensRegistryAbi,
       functionName: 'owner',
       args: [node],
@@ -243,7 +270,7 @@ async function getEnsNameOwner(nameInput: string): Promise<Address | null> {
   } catch {
     owner = null;
   }
-  cacheSet(ck, owner, ENS_CACHE_TTL_MS);
+  cacheSet(ck, owner, ensCacheTtlMs());
   return owner;
 }
 
@@ -323,6 +350,7 @@ export type ConfiguredAgentEnsSummary = {
 
 /** When `ENS_AGENT_NAME` is set: resolve forward + profile + compare with env-derived wallet. */
 export async function getConfiguredAgentEnsSummary(): Promise<ConfiguredAgentEnsSummary | null> {
+  const ENS_AGENT_NAME_RAW = ensAgentNameRaw();
   if (!ENS_AGENT_NAME_RAW) return null;
   const configuredName = normalizeEnsName(ENS_AGENT_NAME_RAW);
   if (!configuredName) return null;
