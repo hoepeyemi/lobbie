@@ -51,16 +51,26 @@ import { ogGalileoTestnet } from './evm/ogGalileoChain.js';
 import { createWalletClient, http, isAddress, parseEther, recoverMessageAddress, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  type ForwardResolveEnsOptions,
   checkEnsAdminAccess,
   checkSubnameCapability,
   ensResolutionEnabled,
   getEnsTextRecord,
   resolveAddressProfile,
   forwardResolveEnsName,
+  evmChainIdToEnsCoinType,
   reverseResolveAddress,
   fetchEnsAgentProfile,
   getConfiguredAgentEnsSummary,
   normalizeEnsName,
+  ENS_ETHEREUM_MAINNET_COIN_TYPE,
+  resolveEnsAgentCoordination,
+  ensCoordinationTrustedAddresses,
+  ensCcipGatewaysConfigured,
+  ensCcipMergeViemDefaultGateway,
+  getEnsCcipConfigSnapshot,
+  previewEnsCcipSessionRouting,
+  sanitizeEnsSessionForApiResponse,
 } from './ens/identity.js';
 import {
   bootstrapComputeAccount,
@@ -182,6 +192,17 @@ type EnsAdminChallenge = {
 
 const ensAdminChallenges = new Map<string, EnsAdminChallenge>();
 
+type EnsA2aPeerChallenge = {
+  nonce: string;
+  peerEnsName: string;
+  message: string;
+  issuedAtIso: string;
+  expiresAtMs: number;
+  used: boolean;
+};
+
+const ensA2aPeerChallenges = new Map<string, EnsA2aPeerChallenge>();
+
 function newChallengeNonce(): string {
   return randomBytes(16).toString('hex');
 }
@@ -215,6 +236,134 @@ function gcEnsChallenges(): void {
   }
   for (const [k, v] of ensAdminChallenges) {
     if (v.expiresAtMs <= now || v.used) ensAdminChallenges.delete(k);
+  }
+  for (const [k, v] of ensA2aPeerChallenges) {
+    if (v.expiresAtMs <= now || v.used) ensA2aPeerChallenges.delete(k);
+  }
+}
+
+function buildEnsA2aPeerMessage(input: {
+  peerEnsName: string;
+  nonce: string;
+  issuedAtIso: string;
+  expiresAtIso: string;
+}): string {
+  return [
+    `Lobbie agent-to-agent coordination`,
+    '',
+    `Peer ENS name: ${input.peerEnsName}`,
+    `Nonce: ${input.nonce}`,
+    `Issued At: ${input.issuedAtIso}`,
+    `Expiration Time: ${input.expiresAtIso}`,
+    '',
+    'Sign this message to prove control of an authorized signer for this name (forward-resolved address or com.lobbie.agent-delegate when set to 0x).',
+  ].join('\n');
+}
+
+function parseEnsMulticoinQuery(req: Request): {
+  coinType?: number;
+  chainId: number | null;
+  sessionKey?: string;
+  error?: string;
+} {
+  const sessionKeyRaw = String(req.query.sessionKey ?? '').trim();
+  const sessionKey = sessionKeyRaw || undefined;
+  const rawCt = String(req.query.coinType ?? '').trim();
+  const rawCid = String(req.query.chainId ?? '').trim();
+  if (rawCt) {
+    const n = Number.parseInt(rawCt, 10);
+    if (!Number.isFinite(n) || n < 0)
+      return { chainId: null, error: 'Query "coinType" must be a non-negative integer', sessionKey };
+    let chainId: number | null = null;
+    if (rawCid) {
+      const cid = Number.parseInt(rawCid, 10);
+      if (Number.isFinite(cid) && cid >= 0) chainId = cid;
+    }
+    return { coinType: n, chainId, sessionKey };
+  }
+  if (rawCid) {
+    const cid = Number.parseInt(rawCid, 10);
+    if (!Number.isFinite(cid) || cid < 0)
+      return { chainId: null, error: 'Query "chainId" must be a non-negative integer', sessionKey };
+    return { coinType: evmChainIdToEnsCoinType(cid), chainId: cid, sessionKey };
+  }
+  return { chainId: null, sessionKey };
+}
+
+function parseEnsMulticoinBody(body: Record<string, unknown>): {
+  coinType?: number;
+  chainId: number | null;
+  sessionKey?: string;
+  error?: string;
+} {
+  const sessionKeyRaw = String(body?.sessionKey ?? '').trim();
+  const sessionKey = sessionKeyRaw || undefined;
+  const rawCt = String(body?.coinType ?? '').trim();
+  const rawCid = String(body?.chainId ?? '').trim();
+  if (rawCt) {
+    const n = Number.parseInt(rawCt, 10);
+    if (!Number.isFinite(n) || n < 0) return { chainId: null, error: 'coinType must be a non-negative integer', sessionKey };
+    let chainId: number | null = null;
+    if (rawCid) {
+      const cid = Number.parseInt(rawCid, 10);
+      if (Number.isFinite(cid) && cid >= 0) chainId = cid;
+    }
+    return { coinType: n, chainId, sessionKey };
+  }
+  if (rawCid) {
+    const cid = Number.parseInt(rawCid, 10);
+    if (!Number.isFinite(cid) || cid < 0) return { chainId: null, error: 'chainId must be a non-negative integer', sessionKey };
+    return { coinType: evmChainIdToEnsCoinType(cid), chainId: cid, sessionKey };
+  }
+  return { chainId: null, sessionKey };
+}
+
+function ensReadOptsFromMc(mc: { coinType?: number; sessionKey?: string }): ForwardResolveEnsOptions | undefined {
+  const o: ForwardResolveEnsOptions = {};
+  if (mc.coinType !== undefined) o.coinType = mc.coinType;
+  if (mc.sessionKey) o.sessionKey = mc.sessionKey;
+  return Object.keys(o).length ? o : undefined;
+}
+
+/** What gateways receive + cache alignment (opaque routing); omit when no sessionKey. */
+function ensSessionRoutingPayload(rawSessionKey?: string | null): Record<string, unknown> | null {
+  const raw = rawSessionKey?.trim();
+  if (!raw) return null;
+  const p = previewEnsCcipSessionRouting(raw);
+  if (!p) return null;
+  return {
+    routingMode: p.routingMode,
+    gatewayQueryParamName: p.gatewayQueryParamName,
+    gatewayQueryParamValue: p.gatewayQueryParamValue,
+    cacheKeySegment: p.cacheKeySegment,
+    mergeViemDefaultGateway: ensCcipMergeViemDefaultGateway(),
+    ccipGatewaysHttpsConfigured: ensCcipGatewaysConfigured(),
+    ccipSessionEffective: Boolean(ensCcipGatewaysConfigured()),
+  };
+}
+
+/** Unified ENS session fields for JSON (redacts raw key when policy requires). */
+function ensApiSessionFields(rawSessionKey?: string | null): Record<string, unknown> {
+  const san = sanitizeEnsSessionForApiResponse(rawSessionKey);
+  const raw = rawSessionKey?.trim();
+  return {
+    ...san,
+    ccipSessionEffective: Boolean(raw && ensCcipGatewaysConfigured()),
+    sessionRouting: raw ? ensSessionRoutingPayload(raw) : null,
+  };
+}
+
+function redactSessionKeyInUrlForLogs(url: string): string {
+  try {
+    const i = url.indexOf('?');
+    if (i < 0) return url;
+    const base = url.slice(0, i);
+    const sp = new URLSearchParams(url.slice(i + 1));
+    if (sp.has('sessionKey')) sp.set('sessionKey', '[redacted]');
+    const q = sp.toString();
+    return q ? `${base}?${q}` : base;
+  } catch {
+    return '[url]';
   }
 }
 
@@ -794,7 +943,8 @@ app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   exposedHeaders: ['X-Payment-Response', 'Payment-Response', 'Payment-Receipt', 'X-402-Version', 'WWW-Authenticate'],
 }));
-app.use(morgan('short'));
+morgan.token('lobbie-url', (req: Request) => redactSessionKeyInUrlForLogs(req.originalUrl || req.url || ''));
+app.use(morgan(':method :lobbie-url :status :res[content-length] - :response-time ms'));
 app.use(express.json({ limit: '2mb' }));
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1671,11 +1821,13 @@ app.get('/api/ens/display', async (req: Request, res: Response) => {
     return;
   }
   try {
-    const { ensName } = await reverseResolveAddress(raw as Address);
+    const sessionKey = String(req.query.sessionKey ?? '').trim() || undefined;
+    const { ensName } = await reverseResolveAddress(raw as Address, sessionKey ? { sessionKey } : undefined);
     res.json({
       address: raw,
       ensName,
       display: ensName || `${raw.slice(0, 6)}…${raw.slice(-4)}`,
+      ...ensApiSessionFields(sessionKey),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1698,8 +1850,20 @@ app.get('/api/ens/profile', async (req: Request, res: Response) => {
     return;
   }
   try {
-    const profile = await fetchEnsAgentProfile(name);
-    res.json({ enabled: true, name: profile?.name || name, profile });
+    const mc = parseEnsMulticoinQuery(req);
+    if (mc.error) {
+      res.status(400).json({ error: mc.error });
+      return;
+    }
+    const profile = await fetchEnsAgentProfile(name, ensReadOptsFromMc(mc));
+    res.json({
+      enabled: true,
+      name: profile?.name || name,
+      coinType: mc.coinType ?? null,
+      chainId: mc.chainId,
+      ...ensApiSessionFields(mc.sessionKey),
+      profile,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: 'ENS profile fetch failed', message: msg });
@@ -1749,13 +1913,16 @@ app.get('/api/ens/verifiable-hooks', async (req: Request, res: Response) => {
     return;
   }
   try {
+    const sessionKey = String(req.query.sessionKey ?? '').trim() || undefined;
+    const tropts = sessionKey ? { sessionKey } : undefined;
     const [vcJwtRef, attestationHash] = await Promise.all([
-      getEnsTextRecord(name, 'vnd.lobbie.vc-jwt'),
-      getEnsTextRecord(name, 'vnd.lobbie.attestation-hash'),
+      getEnsTextRecord(name, 'vnd.lobbie.vc-jwt', tropts),
+      getEnsTextRecord(name, 'vnd.lobbie.attestation-hash', tropts),
     ]);
     res.json({
       enabled: true,
       name: normalizeEnsName(name),
+      ...ensApiSessionFields(sessionKey),
       hooks: {
         vcJwtRef: vcJwtRef || null,
         attestationHash: attestationHash || null,
@@ -1803,7 +1970,9 @@ async function verifyEnsHookFromBody(body: Record<string, unknown>): Promise<{ s
     return { status: 400, json: { error: 'hashAlg must be sha256 or keccak256' } };
   }
   try {
-    const anchor = (await getEnsTextRecord(name, hookKey)) || '';
+    const sessionKeyRaw = String(body?.sessionKey ?? '').trim();
+    const textReadOpts = sessionKeyRaw ? { sessionKey: sessionKeyRaw } : undefined;
+    const anchor = (await getEnsTextRecord(name, hookKey, textReadOpts)) || '';
     if (!anchor) {
       return {
         status: 404,
@@ -1838,7 +2007,8 @@ async function verifyEnsHookFromBody(body: Record<string, unknown>): Promise<{ s
           parsedPayload = JSON.parse(decodeBase64UrlUtf8(parts[1])) as Record<string, unknown>;
           jwtFormatValid = true;
           payloadHashHex = `0x${createHash(hashAlg).update(decodeBase64UrlUtf8(parts[1]), 'utf8').digest('hex')}`;
-          const attestationAnchor = (await getEnsTextRecord(name, 'vnd.lobbie.attestation-hash')) || '';
+          const attestationAnchor =
+            (await getEnsTextRecord(name, 'vnd.lobbie.attestation-hash', textReadOpts)) || '';
           const attestationCandidates = normalizeHashCandidates(attestationAnchor, hashAlg);
           payloadHashMatchesAttestation = attestationCandidates.has(payloadHashHex.toLowerCase());
         } catch (err) {
@@ -1870,6 +2040,7 @@ async function verifyEnsHookFromBody(body: Record<string, unknown>): Promise<{ s
         verified,
         name: normalizeEnsName(name),
         hookKey,
+        ...ensApiSessionFields(sessionKeyRaw),
         hashAlg,
         strictMode: strict,
         computedHash: digestHex,
@@ -1914,12 +2085,338 @@ app.get('/api/ens/forward', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'Invalid or non-ENS name' });
     return;
   }
+  const mc = parseEnsMulticoinQuery(req);
+  if (mc.error) {
+    res.status(400).json({ error: mc.error });
+    return;
+  }
   try {
-    const address = await forwardResolveEnsName(name);
-    res.json({ enabled: true, name, address });
+    const address = await forwardResolveEnsName(name, ensReadOptsFromMc(mc));
+    const multicoin = mc.coinType !== undefined;
+    const coinType = mc.coinType;
+    const chainId = mc.chainId;
+    res.json({
+      enabled: true,
+      name: normalizeEnsName(name),
+      address,
+      coinType: multicoin ? coinType : null,
+      chainId,
+      ...ensApiSessionFields(mc.sessionKey),
+      ethereumMainnetCoinType: ENS_ETHEREUM_MAINNET_COIN_TYPE,
+      routing: multicoin
+        ? {
+            mode: 'multicoin',
+            note:
+              'Address comes from the resolver multicoin record for this coin type. Per-session rotation requires a custom resolver or CCIP-read (EIP-3668) gateway, not this HTTP parameter alone.',
+          }
+        : {
+            mode: 'default',
+            note:
+              'Default Ethereum `addr` record (SLIP-44 60). Pass chainId or coinType for per-chain multicoin resolution.',
+          },
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: 'ENS forward resolution failed', message: msg });
+  }
+});
+
+/** Static pointers for operators building custom / rotating resolvers (no RPC). */
+app.get('/api/ens/privacy-routing', (_req: Request, res: Response) => {
+  const ccip = getEnsCcipConfigSnapshot();
+  res.json({
+    multicoin: {
+      summary: 'Per-chain addresses: set resolver multicoin records; resolve with GET /api/ens/forward?name=&chainId= or &coinType=.',
+      ethereumMainnetCoinType: ENS_ETHEREUM_MAINNET_COIN_TYPE,
+      evmChainCoinType: 'ENSIP-11 / EIP-2304: coinType = 0x80000000 | chainId (mainnet uses 60).',
+    },
+    ccipGateways: {
+      summary:
+        'HTTPS gateways in ENS_CCIP_GATEWAY_URLS are passed to viem Universal Resolver (plus viem’s batch sentinel by default). Session routing uses ENS_CCIP_SESSION_QUERY_PARAM; opaque SHA-256 mode avoids sending raw session IDs to gateways.',
+      configuredGatewayCount: ccip.gatewayUrlCount,
+      mergeViemDefaultGateway: ccip.mergeViemDefaultGateway,
+      sessionQueryParam: ccip.sessionQueryParam,
+      sessionRoutingMode: ccip.sessionRoutingMode,
+      sessionSaltConfigured: ccip.sessionSaltConfigured,
+      discoverEndpoint: 'GET /api/ens/ccip-config',
+      previewEndpoint:
+        'POST /api/ens/session-routing-preview { sessionKey } (preferred) — GET query variant logs via lobbie-url redaction only',
+    },
+    rotationAndPrivacy: {
+      summary:
+        'Gateways resolve CCIP proofs; Lobbie prepends viem’s batch sentinel so names still resolve if custom gateways fail. Use sha256 routing mode + shared ENS_CCIP_SESSION_SALT so gateways bucket rotation without seeing raw session IDs.',
+      approaches: [
+        'Deploy a resolver or CCIP gateway that maps deriveEnsCcipRoutingParam(sessionKey) to your rotation policy.',
+        'Keep ENS_CCIP_MERGE_VIEM_DEFAULT=true unless you fully replicate batch/CCIP behavior in custom URLs.',
+        'Align gateway backends using POST /api/ens/session-routing-preview and gatewayQueryParamValue.',
+      ],
+    },
+  });
+});
+
+/** CCIP / session routing configuration (no raw gateway URLs; no salt values). */
+app.get('/api/ens/ccip-config', (_req: Request, res: Response) => {
+  const snap = getEnsCcipConfigSnapshot();
+  res.json({
+    gatewaysConfigured: snap.gatewayUrlCount > 0,
+    gatewayUrlCount: snap.gatewayUrlCount,
+    mergeViemDefaultGateway: snap.mergeViemDefaultGateway,
+    sessionQueryParam: snap.sessionQueryParam,
+    sessionRoutingMode: snap.sessionRoutingMode,
+    sessionSaltConfigured: snap.sessionSaltConfigured,
+    exposeRawSessionKeyInResponses: snap.exposeRawSessionKeyInResponses,
+    correlationMitigations: [
+      'HTTP JSON omits raw sessionKey when exposeRawSessionKeyInResponses is false (sha256 mode default). gatewayRoutingValue matches HTTPS gateways.',
+      'Access logs redact sessionKey in query strings via morgan lobbie-url token.',
+      'Prefer POST /api/ens/session-routing-preview with JSON body so secrets are not in URLs or proxy logs.',
+      'Global anonymity for ENS names is not cryptographic; resolver/gateway rotation policies remain your on-chain/off-chain contracts.',
+    ],
+    notes:
+      'HTTPS gateways: ENS_CCIP_GATEWAY_URLS. By default viem batch sentinel is merged first (ENS_CCIP_MERGE_VIEM_DEFAULT). Opaque routing: ENS_CCIP_SESSION_ROUTING_MODE=sha256 (+ optional ENS_CCIP_SESSION_SALT). Override JSON echo: ENS_CCIP_EXPOSE_RAW_SESSION_KEY.',
+  });
+});
+
+function jsonSessionRoutingPreview(raw: string) {
+  const prev = previewEnsCcipSessionRouting(raw);
+  if (!prev) return null;
+  return {
+    ...prev,
+    mergeViemDefaultGateway: ensCcipMergeViemDefaultGateway(),
+    ccipGatewaysHttpsConfigured: ensCcipGatewaysConfigured(),
+  };
+}
+
+/** Same derivation Lobbie uses for gateway query params (GET uses query string — prefer POST for sensitive ids). */
+app.get('/api/ens/session-routing-preview', (req: Request, res: Response) => {
+  const raw = String(req.query.sessionKey ?? '').trim();
+  if (!raw) {
+    res.status(400).json({ error: 'Query sessionKey is required (or use POST with JSON body)' });
+    return;
+  }
+  res.setHeader(
+    'X-Lobbie-Session-Preview-Hint',
+    'Prefer POST /api/ens/session-routing-preview with {"sessionKey":"..."} to avoid secrets in URLs.',
+  );
+  const body = jsonSessionRoutingPreview(raw);
+  if (!body) {
+    res.status(400).json({ error: 'Invalid sessionKey' });
+    return;
+  }
+  res.json(body);
+});
+
+/** Prefer this over GET — keeps session material out of URLs and typical access-log paths. */
+app.post('/api/ens/session-routing-preview', (req: Request, res: Response) => {
+  const bodyObj =
+    req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+  const raw = String(bodyObj.sessionKey ?? '').trim();
+  if (!raw) {
+    res.status(400).json({ error: 'JSON body { sessionKey: string } is required' });
+    return;
+  }
+  const body = jsonSessionRoutingPreview(raw);
+  if (!body) {
+    res.status(400).json({ error: 'Invalid sessionKey' });
+    return;
+  }
+  res.json(body);
+});
+
+/** Agent-to-agent discovery via ENS text records only (`com.lobbie.agent-endpoint`, delegate, `url`, `com.lobbie.agent-v1`). */
+app.get('/api/ens/a2a/discover', async (req: Request, res: Response) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'Query "name" is required (e.g. peer.agent.eth)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, name, coordination: null });
+    return;
+  }
+  if (!normalizeEnsName(name)) {
+    res.status(400).json({ error: 'Invalid or non-ENS name' });
+    return;
+  }
+  const mc = parseEnsMulticoinQuery(req);
+  if (mc.error) {
+    res.status(400).json({ error: mc.error });
+    return;
+  }
+  try {
+    const coordination = await resolveEnsAgentCoordination(name, ensReadOptsFromMc(mc));
+    res.json({
+      enabled: true,
+      registryIndependent: true,
+      name: coordination?.name || name,
+      coinType: mc.coinType ?? null,
+      chainId: mc.chainId,
+      ...ensApiSessionFields(mc.sessionKey),
+      coordination,
+      trustedSignerAddresses: coordination ? ensCoordinationTrustedAddresses(coordination) : [],
+      hints: {
+        endpointRecord: 'com.lobbie.agent-endpoint',
+        delegateRecord: 'com.lobbie.agent-delegate',
+        verifyPeer: 'POST /api/ens/a2a/verify-peer (optional POST /api/ens/a2a/challenge for freshness)',
+        ccip:
+          'GET /api/ens/ccip-config — POST /api/ens/session-routing-preview { sessionKey } — gateway param derivation (avoid GET for secrets)',
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS agent coordination discovery failed', message: msg });
+  }
+});
+
+app.post('/api/ens/a2a/challenge', async (req: Request, res: Response) => {
+  const peerEnsName = String(req.body?.peerEnsName || '').trim();
+  if (!peerEnsName) {
+    res.status(400).json({ error: 'peerEnsName is required (e.g. peer.agent.eth)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.status(503).json({ error: 'ENS is disabled (ENS_DISABLED=true)' });
+    return;
+  }
+  const normalizedPeer = normalizeEnsName(peerEnsName);
+  if (!normalizedPeer) {
+    res.status(400).json({ error: 'Invalid or non-ENS peerEnsName' });
+    return;
+  }
+  gcEnsChallenges();
+  const nonce = newChallengeNonce();
+  const issuedAtIso = new Date().toISOString();
+  const expiresAtMs = Date.now() + ENS_CAPABILITY_CHALLENGE_TTL_MS;
+  const expiresAtIso = new Date(expiresAtMs).toISOString();
+  const message = buildEnsA2aPeerMessage({
+    peerEnsName: normalizedPeer,
+    nonce,
+    issuedAtIso,
+    expiresAtIso,
+  });
+  ensA2aPeerChallenges.set(nonce, {
+    nonce,
+    peerEnsName: normalizedPeer,
+    message,
+    issuedAtIso,
+    expiresAtMs,
+    used: false,
+  });
+  res.json({
+    ok: true,
+    challenge: {
+      nonce,
+      message,
+      issuedAt: issuedAtIso,
+      expiresAt: expiresAtIso,
+      ttlMs: ENS_CAPABILITY_CHALLENGE_TTL_MS,
+    },
+  });
+});
+
+/**
+ * Verify EIP-191 signature against ENS-resolved peer addresses only (forward addr + optional 0x delegate).
+ * Optional challengeNonce binds signing to POST /api/ens/a2a/challenge (replay-resistant).
+ */
+app.post('/api/ens/a2a/verify-peer', async (req: Request, res: Response) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+  const peerEnsName = String(body.peerEnsName || '').trim();
+  let message = String(body.message || '').trim();
+  const signature = String(body.signature || '').trim();
+  const challengeNonce = String(body.challengeNonce || '').trim();
+
+  if (!peerEnsName) {
+    res.status(400).json({ error: 'peerEnsName is required' });
+    return;
+  }
+  if (!signature) {
+    res.status(400).json({ error: 'signature is required (0x… EIP-191)' });
+    return;
+  }
+  if (!ensResolutionEnabled()) {
+    res.json({ enabled: false, verified: false, coordination: null });
+    return;
+  }
+
+  const normalizedPeer = normalizeEnsName(peerEnsName);
+  if (!normalizedPeer) {
+    res.status(400).json({ error: 'Invalid or non-ENS peerEnsName' });
+    return;
+  }
+
+  const mc = parseEnsMulticoinBody(body);
+  if (mc.error) {
+    res.status(400).json({ error: mc.error });
+    return;
+  }
+
+  if (challengeNonce) {
+    gcEnsChallenges();
+    const ch = ensA2aPeerChallenges.get(challengeNonce);
+    if (!ch || ch.used || ch.expiresAtMs <= Date.now()) {
+      ensA2aPeerChallenges.delete(challengeNonce);
+      res.status(401).json({ error: 'Invalid or expired A2A challenge nonce', verified: false });
+      return;
+    }
+    if (ch.peerEnsName.toLowerCase() !== normalizedPeer.toLowerCase()) {
+      res.status(401).json({ error: 'challenge peerEnsName does not match request', verified: false });
+      return;
+    }
+    message = ch.message;
+    ch.used = true;
+    ensA2aPeerChallenges.set(challengeNonce, ch);
+  } else if (!message) {
+    res.status(400).json({ error: 'message is required unless challengeNonce is provided' });
+    return;
+  }
+
+  try {
+    const coordination = await resolveEnsAgentCoordination(normalizedPeer, ensReadOptsFromMc(mc));
+    const trusted = coordination ? ensCoordinationTrustedAddresses(coordination) : [];
+
+    if (!coordination || trusted.length === 0) {
+      res.status(200).json({
+        enabled: true,
+        verified: false,
+        reason: 'no-address-or-delegate',
+        peerName: normalizedPeer,
+        ...ensApiSessionFields(mc.sessionKey),
+        coordination,
+      });
+      return;
+    }
+
+    let recovered: Address;
+    try {
+      recovered = await recoverMessageAddress({
+        message,
+        signature: signature as `0x${string}`,
+      });
+    } catch (recoverErr) {
+      const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr);
+      res.status(400).json({ error: 'Signature recovery failed', message: msg, verified: false });
+      return;
+    }
+
+    const verified = trusted.some(a => a.toLowerCase() === recovered.toLowerCase());
+
+    res.json({
+      enabled: true,
+      verified,
+      recoveredAddress: recovered,
+      trustedSignerAddresses: trusted,
+      peerName: normalizedPeer,
+      coinType: mc.coinType ?? null,
+      chainId: mc.chainId,
+      ...ensApiSessionFields(mc.sessionKey),
+      coordination: {
+        serviceEndpoint: coordination.serviceEndpoint,
+        delegate: coordination.delegate,
+        url: coordination.url,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'ENS A2A verify-peer failed', message: msg });
   }
 });
 

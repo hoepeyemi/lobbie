@@ -2,6 +2,7 @@
  * ENS resolution for agent identity: forward + reverse + text records.
  * @see https://docs.ens.domains
  */
+import { createHash } from 'node:crypto';
 import { createPublicClient, http, isAddress, type Address, type PublicClient } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 import { namehash, normalize } from 'viem/ens';
@@ -25,6 +26,163 @@ function ensNetworkRaw(): string {
 
 function ensCacheTtlMs(): number {
   return Math.max(10_000, Number.parseInt(process.env.ENS_CACHE_TTL_MS || '300000', 10) || 300_000);
+}
+
+/** viem’s sentinel so Universal Resolver keeps using bundled CCIP/batch handling alongside HTTPS gateways. @see viem localBatchGatewayUrl */
+const VIEM_LOCAL_BATCH_GATEWAY_URL = 'x-batch-gateway:true' as const;
+
+/** Comma-separated HTTPS CCIP / gateway base URLs for Universal Resolver `resolveWithGateways` (EIP-3668). */
+function parseEnsCcipGatewayUrlsFromEnv(): string[] {
+  const raw = process.env.ENS_CCIP_GATEWAY_URLS?.trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+/** When true (default), prepend viem’s batch sentinel so pure ENS resolution still works alongside custom gateways. Set false only if you intentionally replace all gateway behavior. */
+export function ensCcipMergeViemDefaultGateway(): boolean {
+  return process.env.ENS_CCIP_MERGE_VIEM_DEFAULT !== 'false';
+}
+
+function ensCcipSessionQueryParamName(): string {
+  const q = (process.env.ENS_CCIP_SESSION_QUERY_PARAM || 'lobbieSession').trim();
+  return q || 'lobbieSession';
+}
+
+/** `plain` sends raw sessionKey to gateways; `sha256` sends HMAC-like digest so gateways never see the raw client id on the wire (gateways must derive the same bucket server-side). */
+function ensCcipSessionRoutingMode(): 'plain' | 'sha256' {
+  const m = (process.env.ENS_CCIP_SESSION_ROUTING_MODE || 'plain').trim().toLowerCase();
+  if (m === 'sha256' || m === 'opaque-sha256') return 'sha256';
+  return 'plain';
+}
+
+/**
+ * Value placed on gateway URLs as `ENS_CCIP_SESSION_QUERY_PARAM` for routing / rotation buckets.
+ * In `sha256` mode uses SHA-256(salt NUL rawSessionKey) when salt set, else SHA-256(rawSessionKey).
+ */
+export function deriveEnsCcipRoutingParam(rawSessionKey: string): string {
+  const trimmed = rawSessionKey.trim();
+  if (!trimmed) return '';
+  if (ensCcipSessionRoutingMode() !== 'sha256') return trimmed;
+  const salt = process.env.ENS_CCIP_SESSION_SALT?.trim() ?? '';
+  const input = salt ? `${salt}\x00${trimmed}` : trimmed;
+  return createHash('sha256').update(input, 'utf8').digest('hex');
+}
+
+/** Stable cache segment for a client session key (changes when routing mode or derivation changes). */
+export function ensResolutionSessionCacheKey(rawSessionKey?: string): string {
+  const raw = rawSessionKey?.trim();
+  if (!raw) return '';
+  return `${ensCcipSessionRoutingMode()}:${deriveEnsCcipRoutingParam(raw)}`;
+}
+
+function appendEnsCcipSessionToGatewayUrl(gatewayUrl: string, rawSessionKey: string): string {
+  const paramValue = deriveEnsCcipRoutingParam(rawSessionKey);
+  if (!paramValue) return gatewayUrl;
+  try {
+    const u = new URL(gatewayUrl);
+    u.searchParams.set(ensCcipSessionQueryParamName(), paramValue);
+    return u.href;
+  } catch {
+    return gatewayUrl;
+  }
+}
+
+/**
+ * Gateway URL list for viem ENS actions (`gatewayUrls` on `getEnsAddress`, `getEnsText`, `getEnsName`).
+ * When unset, returns `undefined` so viem uses its default batch gateway only.
+ * With custom URLs: prepends viem batch sentinel by default so resolution does not depend solely on external gateways.
+ * With `sessionKey`, appends derived routing param to each HTTPS gateway URL (not to the sentinel).
+ */
+export function getEnsGatewayUrlsForRead(sessionKey?: string): string[] | undefined {
+  const customHttps = parseEnsCcipGatewayUrlsFromEnv();
+  if (customHttps.length === 0) return undefined;
+
+  const mergeSentinel = ensCcipMergeViemDefaultGateway();
+  const sk = sessionKey?.trim();
+  const httpsPart = sk ? customHttps.map(b => appendEnsCcipSessionToGatewayUrl(b, sk)) : [...customHttps];
+
+  if (!mergeSentinel) return httpsPart;
+  return [VIEM_LOCAL_BATCH_GATEWAY_URL, ...httpsPart];
+}
+
+/** True when `ENS_CCIP_GATEWAY_URLS` lists at least one HTTPS gateway. */
+export function ensCcipGatewaysConfigured(): boolean {
+  return parseEnsCcipGatewayUrlsFromEnv().length > 0;
+}
+
+export function getEnsCcipConfigSnapshot(): {
+  gatewayUrlCount: number;
+  sessionQueryParam: string;
+  mergeViemDefaultGateway: boolean;
+  sessionRoutingMode: 'plain' | 'sha256';
+  sessionSaltConfigured: boolean;
+  exposeRawSessionKeyInResponses: boolean;
+} {
+  return {
+    gatewayUrlCount: parseEnsCcipGatewayUrlsFromEnv().length,
+    sessionQueryParam: ensCcipSessionQueryParamName(),
+    mergeViemDefaultGateway: ensCcipMergeViemDefaultGateway(),
+    sessionRoutingMode: ensCcipSessionRoutingMode(),
+    sessionSaltConfigured: Boolean(process.env.ENS_CCIP_SESSION_SALT?.trim()),
+    exposeRawSessionKeyInResponses: ensCcipExposeRawSessionKeyInApi(),
+  };
+}
+
+/**
+ * Whether HTTP JSON may echo the raw client `sessionKey`.
+ * Default: only in `plain` routing mode. Override with ENS_CCIP_EXPOSE_RAW_SESSION_KEY=true|false.
+ */
+export function ensCcipExposeRawSessionKeyInApi(): boolean {
+  const e = process.env.ENS_CCIP_EXPOSE_RAW_SESSION_KEY?.trim().toLowerCase();
+  if (e === 'true') return true;
+  if (e === 'false') return false;
+  return ensCcipSessionRoutingMode() === 'plain';
+}
+
+export type EnsSanitizedSessionApi = {
+  sessionKey: string | null;
+  /** True when raw key is withheld from JSON (sha256 mode default, or EXPOSE=false). */
+  sessionKeyRedacted: boolean;
+  /** Routing bucket value sent to HTTPS gateways (deriveEnsCcipRoutingParam); safe to expose vs raw when opaque. */
+  gatewayRoutingValue: string | null;
+};
+
+/** Strip raw session from outward JSON when policy requires; always exposes gateway routing bucket for debugging alignment. */
+export function sanitizeEnsSessionForApiResponse(rawSessionKey?: string | null): EnsSanitizedSessionApi {
+  const raw = rawSessionKey?.trim();
+  if (!raw) {
+    return { sessionKey: null, sessionKeyRedacted: false, gatewayRoutingValue: null };
+  }
+  const gw = deriveEnsCcipRoutingParam(raw);
+  if (ensCcipExposeRawSessionKeyInApi()) {
+    return { sessionKey: raw, sessionKeyRedacted: false, gatewayRoutingValue: gw };
+  }
+  return { sessionKey: null, sessionKeyRedacted: true, gatewayRoutingValue: gw };
+}
+
+/** Non-secret preview for operators aligning gateways with Lobbie’s routing derivation. */
+export function previewEnsCcipSessionRouting(rawSessionKey: string): {
+  routingMode: 'plain' | 'sha256';
+  gatewayQueryParamName: string;
+  gatewayQueryParamValue: string;
+  cacheKeySegment: string;
+} | null {
+  const trimmed = rawSessionKey.trim();
+  if (!trimmed) return null;
+  return {
+    routingMode: ensCcipSessionRoutingMode(),
+    gatewayQueryParamName: ensCcipSessionQueryParamName(),
+    gatewayQueryParamValue: deriveEnsCcipRoutingParam(trimmed),
+    cacheKeySegment: ensResolutionSessionCacheKey(trimmed),
+  };
+}
+
+function ensGatewayOpts(sessionKey?: string): { gatewayUrls?: string[] } {
+  const urls = getEnsGatewayUrlsForRead(sessionKey);
+  return urls ? { gatewayUrls: urls } : {};
 }
 
 /** Canonical agent name → forward-resolve and compare with compute/settlement wallet */
@@ -118,20 +276,53 @@ export function normalizeEnsName(input: string): string | null {
   }
 }
 
-/** Forward resolve a name to the default Ethereum address record (same address many EVM chains reuse). */
-export async function forwardResolveEnsName(nameInput: string): Promise<Address | null> {
+/** SLIP-44 multicoin type for Ethereum mainnet (`addr(bytes32)` / default `getEnsAddress`). */
+export const ENS_ETHEREUM_MAINNET_COIN_TYPE = 60;
+
+/**
+ * ENS multicoin coin type for an EVM `chainId` (ENSIP-11 / EIP-2304).
+ * Mainnet (1) uses SLIP-44 type 60; other chains use `0x80000000 | chainId`.
+ * Custom resolvers may still return policy-based or rotating addresses for that coin type.
+ */
+export function evmChainIdToEnsCoinType(chainId: number): number {
+  if (!Number.isFinite(chainId) || chainId < 0) return ENS_ETHEREUM_MAINNET_COIN_TYPE;
+  if (chainId === 1) return ENS_ETHEREUM_MAINNET_COIN_TYPE;
+  return (0x80000000 | chainId) >>> 0;
+}
+
+export type ForwardResolveEnsOptions = {
+  /** Multicoin SLIP-44 / ENSIP-11 coin type. Omit to use the default Ethereum record. */
+  coinType?: number;
+  /**
+   * Session bucket forwarded to HTTPS gateways as `ENS_CCIP_SESSION_QUERY_PARAM`.
+   * When `ENS_CCIP_SESSION_ROUTING_MODE=sha256`, gateways receive SHA-256(salt NUL key) instead of raw (unlinkability from gateways).
+   * Sentinel batch gateway (`x-batch-gateway:true`) is unchanged by rotation semantics.
+   */
+  sessionKey?: string;
+};
+
+/** Forward resolve a name to an address (default ETH record, or multicoin `addr(node, coinType)` when set). */
+export async function forwardResolveEnsName(
+  nameInput: string,
+  options?: ForwardResolveEnsOptions,
+): Promise<Address | null> {
   if (!ensResolutionEnabled()) return null;
   const name = normalizeEnsName(nameInput);
   if (!name) return null;
 
-  const ck = `forward:${name}`;
+  const coinType = options?.coinType;
+  const ck = `forward:${name}:${coinType ?? 'default'}:${ensResolutionSessionCacheKey(options?.sessionKey)}`;
   const hit = cacheGet<Address | null>(ck);
   if (hit !== undefined) return hit;
 
   const client = getEnsEthClient();
+  const gw = ensGatewayOpts(options?.sessionKey);
   let addr: Address | null = null;
   try {
-    const a = await client.getEnsAddress({ name });
+    const a =
+      coinType !== undefined
+        ? await client.getEnsAddress({ name, coinType: BigInt(coinType), ...gw })
+        : await client.getEnsAddress({ name, ...gw });
     addr = a && isAddress(a) ? a : null;
   } catch {
     addr = null;
@@ -148,18 +339,22 @@ export type ReverseEnsResult = {
 /**
  * Reverse lookup for logs/UI. Prefer showing `ensName` when set; falls back to truncated hex elsewhere.
  */
-export async function reverseResolveAddress(address: Address): Promise<ReverseEnsResult> {
+export async function reverseResolveAddress(
+  address: Address,
+  options?: Pick<ForwardResolveEnsOptions, 'sessionKey'>,
+): Promise<ReverseEnsResult> {
   if (!ensResolutionEnabled()) return { ensName: null };
   if (!isAddress(address)) return { ensName: null };
 
   const lower = address.toLowerCase() as Address;
-  const ck = `reverse:${lower}`;
+  const ck = `reverse:${lower}:${ensResolutionSessionCacheKey(options?.sessionKey)}`;
   const hit = cacheGet<string | null>(ck);
   if (hit !== undefined) return { ensName: hit };
 
+  const gw = ensGatewayOpts(options?.sessionKey);
   let ensName: string | null = null;
   try {
-    ensName = await getEnsEthClient().getEnsName({ address });
+    ensName = await getEnsEthClient().getEnsName({ address, ...gw });
   } catch {
     ensName = null;
   }
@@ -172,6 +367,10 @@ export const ENS_AGENT_TEXT_KEYS = [
   'url',
   'avatar',
   'com.lobbie.agent-v1',
+  /** HTTPS base URL for agent HTTP/A2A APIs (preferred over generic `url` for machines). */
+  'com.lobbie.agent-endpoint',
+  /** Optional delegate signer — typically `0x…` EVM address; opaque URIs are surfaced but not used for EIP-191 checks. */
+  'com.lobbie.agent-delegate',
   'vnd.lobbie.vc-jwt',
   'vnd.lobbie.attestation-hash',
 ] as const;
@@ -194,19 +393,27 @@ export type ResolvedAddressProfile = {
 };
 
 /** Text records + optional JSON in `com.lobbie.agent-v1` for machine-readable agent metadata. */
-export async function fetchEnsAgentProfile(nameInput: string): Promise<EnsAgentProfile | null> {
+export async function fetchEnsAgentProfile(
+  nameInput: string,
+  options?: ForwardResolveEnsOptions,
+): Promise<EnsAgentProfile | null> {
   if (!ensResolutionEnabled()) return null;
   const name = normalizeEnsName(nameInput);
   if (!name) return null;
 
-  const ck = `profile:${name}`;
+  const coinType = options?.coinType;
+  const ck = `profile:${name}:${coinType ?? 'default'}:${ensResolutionSessionCacheKey(options?.sessionKey)}`;
   const hit = cacheGet<EnsAgentProfile>(ck);
   if (hit) return hit;
 
   const client = getEnsEthClient();
+  const gw = ensGatewayOpts(options?.sessionKey);
   let resolvedAddress: Address | null = null;
   try {
-    const a = await client.getEnsAddress({ name });
+    const a =
+      coinType !== undefined
+        ? await client.getEnsAddress({ name, coinType: BigInt(coinType), ...gw })
+        : await client.getEnsAddress({ name, ...gw });
     resolvedAddress = a && isAddress(a) ? a : null;
   } catch {
     resolvedAddress = null;
@@ -216,7 +423,7 @@ export async function fetchEnsAgentProfile(nameInput: string): Promise<EnsAgentP
   await Promise.all(
     ENS_AGENT_TEXT_KEYS.map(async key => {
       try {
-        const v = await client.getEnsText({ name, key });
+        const v = await client.getEnsText({ name, key, ...gw });
         if (v) text[key] = v;
       } catch {
         // missing key
@@ -248,10 +455,91 @@ export async function fetchEnsAgentProfile(nameInput: string): Promise<EnsAgentP
   return profile;
 }
 
+/** Discovery bundle for agent-to-agent coordination (reads ENS only — no central registry). */
+export type EnsAgentCoordination = {
+  name: string;
+  resolvedAddress: Address | null;
+  /** Preferred machine-facing HTTP(S) base URL for this agent’s APIs. */
+  serviceEndpoint: string | null;
+  /** Human-facing URL from ENS `url` text record (often overlaps with service endpoint). */
+  url: string | null;
+  /** Delegate identity — usually same-chain signer address as `0x…`; may be DID or other URI. */
+  delegate: string | null;
+  lobbieAgentJson: Record<string, unknown> | null;
+};
+
+function pickFirstHttpUrl(...candidates: (string | undefined | null)[]): string | null {
+  for (const raw of candidates) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) continue;
+    try {
+      const u = new URL(s);
+      if (u.protocol === 'http:' || u.protocol === 'https:') return u.toString();
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve `.eth` text records for peer discovery: service endpoint, delegate, `url`.
+ * Endpoint precedence: `com.lobbie.agent-endpoint` → keys inside `com.lobbie.agent-v1` JSON → `url`.
+ */
+export async function resolveEnsAgentCoordination(
+  nameInput: string,
+  options?: ForwardResolveEnsOptions,
+): Promise<EnsAgentCoordination | null> {
+  const profile = await fetchEnsAgentProfile(nameInput, options);
+  if (!profile) return null;
+
+  const j = profile.lobbieAgentJson;
+  const serviceEndpoint = pickFirstHttpUrl(
+    profile.text['com.lobbie.agent-endpoint'],
+    typeof j?.serviceEndpoint === 'string' ? j.serviceEndpoint : undefined,
+    typeof j?.endpoint === 'string' ? j.endpoint : undefined,
+    typeof j?.a2aEndpoint === 'string' ? j.a2aEndpoint : undefined,
+    typeof j?.a2aUrl === 'string' ? j.a2aUrl : undefined,
+    typeof j?.baseUrl === 'string' ? j.baseUrl : undefined,
+    profile.text.url,
+  );
+
+  const delegateRaw =
+    profile.text['com.lobbie.agent-delegate']?.trim() ||
+    (typeof j?.delegate === 'string' ? j.delegate.trim() : '') ||
+    (typeof j?.authorizedSigner === 'string' ? j.authorizedSigner.trim() : '') ||
+    '';
+  const delegate = delegateRaw || null;
+
+  const urlOnly = profile.text.url?.trim();
+  const url = pickFirstHttpUrl(urlOnly) || (urlOnly ? urlOnly : null);
+
+  return {
+    name: profile.name,
+    resolvedAddress: profile.resolvedAddress,
+    serviceEndpoint,
+    url,
+    delegate,
+    lobbieAgentJson: profile.lobbieAgentJson,
+  };
+}
+
+/** Addresses this server will accept as “peer identity” for EIP-191 verification (forward addr + optional EVM delegate). */
+export function ensCoordinationTrustedAddresses(coord: EnsAgentCoordination): Address[] {
+  const out: Address[] = [];
+  if (coord.resolvedAddress && isAddress(coord.resolvedAddress)) out.push(coord.resolvedAddress);
+  const d = coord.delegate?.trim();
+  if (d && isAddress(d)) out.push(d as Address);
+  return out;
+}
+
 /** Reverse lookup + text records in one call for agent cards/registry enrichment. */
-export async function resolveAddressProfile(address: Address): Promise<ResolvedAddressProfile> {
-  const { ensName } = await reverseResolveAddress(address);
-  const profile = ensName ? await fetchEnsAgentProfile(ensName) : null;
+export async function resolveAddressProfile(
+  address: Address,
+  options?: Pick<ForwardResolveEnsOptions, 'sessionKey'>,
+): Promise<ResolvedAddressProfile> {
+  const { ensName } = await reverseResolveAddress(address, options);
+  const profile = ensName ? await fetchEnsAgentProfile(ensName, options) : null;
   return {
     address,
     ensName,
@@ -284,16 +572,21 @@ export async function getEnsNameOwner(nameInput: string): Promise<Address | null
   return owner;
 }
 
-export async function getEnsTextRecord(nameInput: string, key: string): Promise<string | null> {
+export async function getEnsTextRecord(
+  nameInput: string,
+  key: string,
+  options?: Pick<ForwardResolveEnsOptions, 'sessionKey'>,
+): Promise<string | null> {
   if (!ensResolutionEnabled()) return null;
   const name = normalizeEnsName(nameInput);
   if (!name || !key.trim()) return null;
-  const cacheKey = `text:${name}:${key}`;
+  const cacheKey = `text:${name}:${key}:${ensResolutionSessionCacheKey(options?.sessionKey)}`;
   const hit = cacheGet<string | null>(cacheKey);
   if (hit !== undefined) return hit;
+  const gw = ensGatewayOpts(options?.sessionKey);
   let value: string | null = null;
   try {
-    value = await getEnsEthClient().getEnsText({ name, key: key.trim() });
+    value = await getEnsEthClient().getEnsText({ name, key: key.trim(), ...gw });
   } catch {
     value = null;
   }
